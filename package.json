@@ -1,0 +1,21 @@
+{
+  "name": "hcow-contracts",
+  "version": "1.0.0",
+  "private": false,
+  "license": "MIT",
+  "description": "HashCow token and vesting contracts for BNB Smart Chain",
+  "scripts": {
+    "compile": "node compile.cjs",
+    "test": "node test.cjs && node audit.cjs"
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "5.0.2",
+    "solc": "0.8.24",
+    "@ethereumjs/block": "5.3.0",
+    "@ethereumjs/common": "4.4.0",
+    "@ethereumjs/tx": "5.4.0",
+    "@ethereumjs/util": "9.1.0",
+    "@ethereumjs/vm": "8.1.1",
+    "ethers": "6.13.2"
+  }
+}
