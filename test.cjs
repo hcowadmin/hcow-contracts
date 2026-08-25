@@ -168,7 +168,8 @@ async function main() {
   // The caller states what it expects the loaded set to add up to. Reading the
   // figures back and eyeballing them is the step that gets skipped, and the
   // mistake it is meant to catch does not move either total.
-  const SEAL_ARGS = [9n, 200_000_000n * E18, 27_000_000n * E18];
+  const LOADED_HASH = await read(vestAbi, vest, 'scheduleHash');
+  const SEAL_ARGS = [9n, 200_000_000n * E18, 27_000_000n * E18, LOADED_HASH];
 
   // nothing may leave before the set is final
   {
@@ -186,16 +187,18 @@ async function main() {
   eq(await read(vestAbi, vest, 'fundingShortfall'), 0n, 'shortfall closed before sealing');
 
   // a commitment that disagrees with what was loaded is refused, one field at a time
-  for (const [i, label] of [[0, 'beneficiary count'], [1, 'scheduled total'], [2, 'TGE unlock']]) {
+  for (const [i, label] of [[0, 'beneficiary count'], [1, 'scheduled total'], [2, 'TGE unlock'], [3, 'schedule hash']]) {
     const bad = [...SEAL_ARGS];
-    bad[i] = bad[i] + 1n;
+    bad[i] = i === 3
+      ? '0x' + (BigInt(bad[3]) ^ 1n).toString(16).padStart(64, '0')
+      : bad[i] + 1n;
     const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', bad) });
     ok(!!r.execResult.exceptionError, `a wrong ${label} in the commitment refuses the seal`);
   }
   // and the merge the allocation table warns about: two community tranches as
   // one entry leaves both totals correct and only the count wrong
   {
-    const bad = [8n, SEAL_ARGS[1], SEAL_ARGS[2]];
+    const bad = [8n, SEAL_ARGS[1], SEAL_ARGS[2], SEAL_ARGS[3]];
     const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', bad) });
     ok(!!r.execResult.exceptionError, 'a merged community tranche is caught by the count');
   }

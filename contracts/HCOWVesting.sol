@@ -20,9 +20,10 @@ interface IERC20Supply {
  *     whole point: an investor must be able to verify that their allocation
  *     is not at the team's discretion.
  *
- *  2. THE OWNER CAN ONLY ADD SCHEDULES, AND ONLY UNTIL SEALED. After seal()
- *     no schedule can ever be added. Call seal() before TGE. From that moment
- *     the owner has no remaining power over this contract at all.
+ *  2. THE OWNER CAN ONLY ADD SCHEDULES, AND ONLY UNTIL SEALED, AND NEVER AT
+ *     OR AFTER TGE. After seal() no schedule can ever be added, by anyone.
+ *     Seal before TGE. From that moment the owner has no remaining power over
+ *     this contract at all.
  *
  *  3. RELEASE IS PERMISSIONLESS. Anyone may call release(beneficiary). Tokens
  *     always go to the beneficiary, never to the caller. This means a
@@ -30,8 +31,13 @@ interface IERC20Supply {
  *     contract usable by automation.
  *
  *  4. TIME IS ABSOLUTE, NOT RELATIVE TO DEPOSIT. `tgeTime` is set once at
- *     construction. Cliff and linear duration are measured from it. A schedule
- *     added after TGE therefore vests correctly for elapsed time.
+ *     construction. Cliff and linear duration are measured from it, so a
+ *     schedule added late still vests correctly for elapsed time. Adding one
+ *     at or after `tgeTime` is refused anyway: it could unlock in the block it
+ *     is written, which is the whole of the owner's remaining power. Sealing,
+ *     by contrast, has no deadline and after TGE is permissionless, because a
+ *     seal that becomes impossible locks everything the contract holds
+ *     forever and nobody can undo it.
  *
  *  5. MONTHS ARE 30 DAYS. Stated explicitly so no one has to guess. A
  *     "12 month cliff and 24 month linear" is 360 days then 720 days.
@@ -46,6 +52,11 @@ contract HCOWVesting is Ownable2Step {
 
     uint256 public constant MONTH = 30 days;
     uint256 public constant BPS = 10_000;
+    /// @notice Hard bound so seal() can never become too expensive to call.
+    ///         The published allocation uses nine.
+    uint256 public constant MAX_BENEFICIARIES = 200;
+    /// @notice Deploying with a TGE further out than this is a typo, not a plan.
+    uint256 public constant MAX_TGE_HORIZON = 365 days;
 
     struct Schedule {
         uint128 total;        // total tokens for this beneficiary
@@ -57,6 +68,12 @@ contract HCOWVesting is Ownable2Step {
     }
 
     IERC20 public immutable token;
+    /// @notice Token supply as it stood when this contract was deployed.
+    ///         The bound below is a sanity check on data entry, so it is taken
+    ///         once. Reading live totalSupply() instead would mean that a burn
+    ///         of one wei by any holder, at any time before the last schedule
+    ///         is added, permanently blocks loading the published table.
+    uint256 public immutable supplyCap;
     /// @notice Unix seconds. All cliff and linear maths are measured from here.
     uint256 public immutable tgeTime;
 
@@ -69,6 +86,16 @@ contract HCOWVesting is Ownable2Step {
     uint256 public totalReleased;
     /// @notice Once true, no schedule can ever be added.
     bool public sealed_;
+    /// @notice Running commitment over every schedule as it was added, in
+    ///         order, field by field. seal() checks it.
+    ///
+    ///         totalScheduled, totalTgeUnlock and the beneficiary count are all
+    ///         invariant under a transposition of cliffMonths and linearMonths,
+    ///         which is the likeliest mistake in a five argument call with two
+    ///         adjacent same typed arguments. That mistake is irreversible and
+    ///         it is invisible to every other check in this contract. This is
+    ///         the only field that moves when it happens.
+    bytes32 public scheduleHash;
 
     event ScheduleAdded(
         address indexed beneficiary,
@@ -91,7 +118,9 @@ contract HCOWVesting is Ownable2Step {
     error ExceedsTokenSupply();
     error NotFunded(uint256 required, uint256 held);
     error NotSealed();
-    error SealAfterTge();
+    error AddAfterTge();
+    error TooManyBeneficiaries();
+    error TgeTooFar();
     error NoSchedules();
     error CommitmentMismatch(uint256 scheduled, uint256 tgeUnlock);
     error DegenerateSchedule();
@@ -106,8 +135,18 @@ contract HCOWVesting is Ownable2Step {
     constructor(address token_, uint256 tgeTime_, address owner_) Ownable(owner_) {
         if (token_ == address(0) || owner_ == address(0)) revert ZeroAddress();
         if (tgeTime_ <= block.timestamp) revert TgeInThePast();
+        if (tgeTime_ > block.timestamp + MAX_TGE_HORIZON) revert TgeTooFar();
         token = IERC20(token_);
         tgeTime = tgeTime_;
+        uint256 cap = IERC20Supply(token_).totalSupply();
+        // A zero cap refuses every addSchedule, and with no schedules seal()
+        // reverts NoSchedules, ownership cannot be renounced and tgeTime cannot
+        // be changed: the contract is born dead. It is what deploying against a
+        // token that has not minted yet looks like. HCOWToken mints in its own
+        // constructor so this cannot happen with it, but the contract should
+        // not depend on that to avoid bricking.
+        if (cap == 0) revert ExceedsTokenSupply();
+        supplyCap = cap;
     }
 
     // ---------------------------------------------------------------- admin
@@ -120,6 +159,12 @@ contract HCOWVesting is Ownable2Step {
         uint16 linearMonths
     ) public onlyOwner {
         if (sealed_) revert AlreadySealed();
+        // A schedule added at or after TGE can unlock in the block it is
+        // written, which is the whole of the owner's remaining power. Closing
+        // this door here is what lets seal() stay callable after TGE, and a
+        // seal() that stays callable is what stops a missed deadline from
+        // locking the entire balance forever.
+        if (block.timestamp >= tgeTime) revert AddAfterTge();
         if (beneficiary == address(0)) revert ZeroAddress();
         // This contract and the token itself both accept transfers, so a
         // schedule pointing at either is paid out and lost with no error.
@@ -128,11 +173,15 @@ contract HCOWVesting is Ownable2Step {
         }
         if (total == 0) revert ZeroAmount();
         if (tgeBps > BPS) revert InvalidBps();
-        // All three zero is what a default initialised struct or a transposed
-        // argument looks like, and it means the whole allocation unlocks in the
-        // block it is added. Never a real schedule.
-        if (tgeBps == 0 && cliffMonths == 0 && linearMonths == 0) revert DegenerateSchedule();
+        // With no cliff and no linear period there is nothing left to vest, so
+        // the whole allocation lands at TGE whatever tgeBps says. All three
+        // zero is the default initialised struct; a partial tgeBps with both
+        // periods zero is a dropped or defaulted linearMonths argument. Both
+        // report a TGE unlock that is not the one that happens, which defeats
+        // the commitment seal() checks. Neither is ever a real schedule.
+        if (cliffMonths == 0 && linearMonths == 0 && tgeBps != BPS) revert DegenerateSchedule();
         if (schedules[beneficiary].exists) revert ScheduleExists();
+        if (_beneficiaries.length >= MAX_BENEFICIARIES) revert TooManyBeneficiaries();
 
         schedules[beneficiary] = Schedule({
             total: total,
@@ -146,7 +195,10 @@ contract HCOWVesting is Ownable2Step {
         totalScheduled += total;
         // Sanity bound. Scheduling more than exists can only be a data entry
         // error, and it would be discovered later as an unfundable contract.
-        if (totalScheduled > IERC20Supply(address(token)).totalSupply()) revert ExceedsTokenSupply();
+        if (totalScheduled > supplyCap) revert ExceedsTokenSupply();
+        scheduleHash = keccak256(
+            abi.encodePacked(scheduleHash, beneficiary, total, tgeBps, cliffMonths, linearMonths)
+        );
 
         emit ScheduleAdded(beneficiary, total, tgeBps, cliffMonths, linearMonths);
     }
@@ -190,6 +242,13 @@ contract HCOWVesting is Ownable2Step {
      *      because the runbook is the thing that gets skipped at four in the
      *      morning on TGE day.
      *
+     * @dev `expectedTgeUnlock` is what the loaded table releases at `tgeTime`,
+     *      which is a property of the table and not of the moment this is
+     *      called. Sealing late does not change it and does not change what any
+     *      beneficiary receives; it only means more of the schedule has already
+     *      matured by the time the switch is thrown. The figure to sign off is
+     *      always the one from the published allocation.
+     *
      *      It also closes the window this contract's owner key is exposed in:
      *      before sealing, that key can add a schedule for itself at a full
      *      TGE unlock and take the balance. Fund, verify, and seal in one
@@ -198,17 +257,32 @@ contract HCOWVesting is Ownable2Step {
     function seal(
         uint256 expectedBeneficiaries,
         uint256 expectedScheduled,
-        uint256 expectedTgeUnlock
-    ) external onlyOwner {
+        uint256 expectedTgeUnlock,
+        bytes32 expectedScheduleHash
+    ) external {
+        // Owner only until TGE, then anyone. Before TGE the owner is still
+        // loading the table and nobody else should be able to freeze it half
+        // written. At TGE the table is frozen anyway, addSchedule is closed,
+        // and the four commitments have to match figures that are already
+        // public, so the only thing another caller can do is finish a job that
+        // was left undone. Leaving it owner only past that point means an owner
+        // key that is lost, frozen or simply unwilling holds every
+        // beneficiary's tokens hostage forever, with no sweep and no recovery.
+        if (block.timestamp < tgeTime && msg.sender != owner()) {
+            revert OwnableUnauthorizedAccount(msg.sender);
+        }
         if (sealed_) revert AlreadySealed();
-        // Sealing after TGE would let a schedule written moments earlier unlock
-        // in the same block, which is the whole of the owner's remaining power.
-        if (block.timestamp >= tgeTime) revert SealAfterTge();
+        // There is deliberately no deadline here. addSchedule is what closes at
+        // TGE; sealing is the act that ends the owner's power and it must never
+        // become impossible, because release() is gated on it and there is no
+        // sweep. A deadline on this function turns a missed calendar date into
+        // the permanent loss of everything the contract holds.
         if (_beneficiaries.length == 0) revert NoSchedules();
         if (
             _beneficiaries.length != expectedBeneficiaries ||
             totalScheduled != expectedScheduled ||
-            totalTgeUnlock() != expectedTgeUnlock
+            totalTgeUnlock() != expectedTgeUnlock ||
+            scheduleHash != expectedScheduleHash
         ) revert CommitmentMismatch(totalScheduled, totalTgeUnlock());
 
         uint256 owed = totalScheduled - totalReleased;
@@ -216,6 +290,10 @@ contract HCOWVesting is Ownable2Step {
         if (held < owed) revert NotFunded(owed, held);
 
         sealed_ = true;
+        // A transfer started before sealing must not be able to complete after
+        // it. Nothing an owner can do post seal has any effect, but an explorer
+        // showing a live pending administrator invites the question.
+        _transferOwnership(owner());
         emit Sealed(_beneficiaries.length, totalScheduled);
     }
 
@@ -261,10 +339,16 @@ contract HCOWVesting is Ownable2Step {
         super.transferOwnership(newOwner);
     }
 
-    function renounceOwnership() public override onlyOwner {
+    function acceptOwnership() public override {
+        if (sealed_) revert AlreadySealed();
+        super.acceptOwnership();
+    }
+
+    function renounceOwnership() public pure override {
         // Before sealing this would make seal() uncallable forever, leaving a
         // contract nobody can finish and nobody can add to. After sealing there
-        // is nothing left to renounce.
+        // is nothing left to renounce. Unconditional, and pure, so that the
+        // compiler emits no warning about it.
         revert AlreadySealed();
     }
 
@@ -272,21 +356,24 @@ contract HCOWVesting is Ownable2Step {
 
     /// @notice Total vested so far, released or not.
     function vestedAmount(address beneficiary) public view returns (uint256) {
-        Schedule memory s = schedules[beneficiary];
+        return _vestedAt(schedules[beneficiary], block.timestamp);
+    }
+
+    function _vestedAt(Schedule memory s, uint256 ts) private view returns (uint256) {
         if (!s.exists) return 0;
-        if (block.timestamp < tgeTime) return 0;
+        if (ts < tgeTime) return 0;
 
         uint256 tgeAmount = (uint256(s.total) * s.tgeBps) / BPS;
         uint256 remainder = uint256(s.total) - tgeAmount;
         if (remainder == 0) return s.total;
 
         uint256 cliffEnd = tgeTime + (uint256(s.cliffMonths) * MONTH);
-        if (block.timestamp < cliffEnd) return tgeAmount;
+        if (ts < cliffEnd) return tgeAmount;
 
         uint256 duration = uint256(s.linearMonths) * MONTH;
         if (duration == 0) return s.total;
 
-        uint256 elapsed = block.timestamp - cliffEnd;
+        uint256 elapsed = ts - cliffEnd;
         if (elapsed >= duration) return s.total;
 
         return tgeAmount + (remainder * elapsed) / duration;
@@ -303,13 +390,19 @@ contract HCOWVesting is Ownable2Step {
         return held >= owed ? 0 : owed - held;
     }
 
-    /// @notice Sum of every schedule's TGE unlock. Use this to verify the
-    ///         published TGE circulating supply before deploying.
+    /// @notice What this contract will actually release at tgeTime, summed
+    ///         across every schedule. Use it to verify the published TGE
+    ///         circulating supply before deploying.
+    ///
+    /// @dev    This runs the same vesting maths release() will run rather than
+    ///         summing tgeBps, so the figure seal() commits to is the figure
+    ///         that happens. Those two are not the same number for every
+    ///         schedule shape, and where they differ it is the tgeBps sum that
+    ///         is wrong.
     function totalTgeUnlock() public view returns (uint256 sum) {
         uint256 n = _beneficiaries.length;
         for (uint256 i = 0; i < n; ++i) {
-            Schedule memory s = schedules[_beneficiaries[i]];
-            sum += (uint256(s.total) * s.tgeBps) / BPS;
+            sum += _vestedAt(schedules[_beneficiaries[i]], tgeTime);
         }
     }
 

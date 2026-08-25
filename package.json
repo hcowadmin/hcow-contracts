@@ -1,12 +1,10 @@
 {
   "name": "hcow-contracts",
   "version": "1.0.0",
-  "private": false,
-  "license": "MIT",
-  "description": "HashCow token and vesting contracts for BNB Smart Chain",
+  "private": true,
   "scripts": {
     "compile": "node compile.cjs",
-    "test": "node test.cjs && node audit.cjs"
+    "test": "node compile.cjs && node test.cjs && node audit.cjs"
   },
   "devDependencies": {
     "@openzeppelin/contracts": "5.0.2",

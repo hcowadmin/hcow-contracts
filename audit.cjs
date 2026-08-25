@@ -42,7 +42,8 @@ async function sealNow(vestAbi, v) {
   const n = await read(vestAbi, v, 'beneficiaryCount');
   const t = await read(vestAbi, v, 'totalScheduled');
   const g = await read(vestAbi, v, 'totalTgeUnlock');
-  return send({ to: v, data: vestAbi.encodeFunctionData('seal', [n, t, g]) });
+  const h = await read(vestAbi, v, 'scheduleHash');
+  return send({ to: v, data: vestAbi.encodeFunctionData('seal', [n, t, g, h]) });
 }
 
 async function main() {
@@ -60,6 +61,11 @@ async function main() {
   {
     const rt = await deploy('ReentrantToken', reAbi, []);
     const tge = now + 1n;
+    // Mint before the vesting contract is deployed. HCOWVesting snapshots the
+    // token supply in its constructor rather than reading it live, so a token
+    // whose supply appears afterwards leaves the bound at zero. HCOWToken mints
+    // its whole supply in its own constructor, so this ordering is the real one.
+    await send({ to: rt, data: reAbi.encodeFunctionData('mint', [acc[0].toString(), 10_000n * E18]) });
     const v = await deploy('HCOWVesting', vestAbi, [rt.toString(), tge, acc[0].toString()]);
     // Fund well above one schedule's total, and add a second schedule, so a
     // successful re-entrant payout would actually be fundable. Minting exactly
@@ -89,9 +95,13 @@ async function main() {
   {
     const sf = await deploy('SilentFailToken', sfAbi, []);
     const tge = now + 1n;
+    await send({ to: sf, data: sfAbi.encodeFunctionData('mint', [acc[0].toString(), 100n * E18]) });
     const v = await deploy('HCOWVesting', vestAbi, [sf.toString(), tge, acc[0].toString()]);
     await send({ to: sf, data: sfAbi.encodeFunctionData('mint', [v.toString(), 100n * E18]) });
     await send({ to: v, data: vestAbi.encodeFunctionData('addSchedule', [acc[2].toString(), 100n * E18, 10000, 0, 0]) });
+    // Seal, or release() stops at the NotSealed gate and the assertion below
+    // never reaches SafeERC20 at all.
+    await sealNow(vestAbi, v);
     now = tge + 1n;
     const r = await send({ to: v, data: vestAbi.encodeFunctionData('release', [acc[2].toString()]) });
     ok(!!r.execResult.exceptionError, 'a token that returns false instead of reverting causes release to revert, not to silently mark tokens released');
@@ -105,7 +115,8 @@ async function main() {
     const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
     for (const [fn, args] of [
       ['addSchedule', [acc[3].toString(), 1n * E18, 0, 0, 1]],
-      ['seal', [1n, 1n, 0n]],
+      // seal is owner-only until TGE; `now` is ten days before it here.
+      ['seal', [1n, 1n, 0n, '0x' + '00'.repeat(32)]],
     ]) {
       const r = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData(fn, args) });
       ok(!!r.execResult.exceptionError, `a stranger cannot call ${fn}()`);
@@ -226,6 +237,168 @@ async function main() {
     // DOMAIN_SEPARATOR is chain-bound
     const ds = await read(tokenAbi, t, 'DOMAIN_SEPARATOR');
     ok(typeof ds === 'string' && ds.length === 66, 'EIP-712 domain separator is present for permit');
+  }
+
+  // ============ G. Regressions from the 2026-08-25 system review ============
+  console.log('\nG. 2026-08-25 시스템 검수 회귀');
+  {
+    // G-1  A schedule with no cliff and no linear period unlocks everything at
+    //      TGE whatever tgeBps says, so the figure seal() commits to would not
+    //      be the figure that happens. A dropped fifth argument produces it.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const tge = now + 10n * DAY;
+    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+    const bad = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[3].toString(), 60_000_000n * E18, 1500, 0, 0]) });
+    ok(!!bad.execResult.exceptionError,
+       'a schedule with a partial TGE unlock but no cliff and no linear period is refused');
+    const full = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[3].toString(), 100n * E18, 10000, 0, 0]) });
+    ok(!full.execResult.exceptionError,
+       'a deliberate full unlock at TGE is still allowed, since it says what it does');
+
+    // G-2  totalTgeUnlock reports what will actually be released at tgeTime,
+    //      not the sum of tgeBps.
+    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[4].toString(), 100n * E18, 0, 3, 0]) });
+    eq(await read(vestAbi, v, 'totalTgeUnlock'), 100n * E18,
+       'a cliff-drop schedule contributes nothing to the TGE unlock figure');
+  }
+  {
+    // G-3  Transposing cliffMonths and linearMonths leaves the count, the
+    //      scheduled total and the TGE unlock all correct. Only the schedule
+    //      hash moves, and seal() checks it.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const tge = now + 10n * DAY;
+    const rows = [[20_000_000n, 2500, 0, 3], [10_000_000n, 0, 12, 36]];
+    const load2 = async (swap) => {
+      const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+      for (let i = 0; i < rows.length; i++) {
+        const [amt, bps, c, l] = rows[i];
+        await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+          [acc[2 + i].toString(), amt * E18, bps, swap ? l : c, swap ? c : l]) });
+      }
+      return v;
+    };
+    const good = await load2(false), swapped = await load2(true);
+    eq(await read(vestAbi, swapped, 'beneficiaryCount'), await read(vestAbi, good, 'beneficiaryCount'),
+       'a transposed cliff and linear leaves the beneficiary count identical');
+    eq(await read(vestAbi, swapped, 'totalScheduled'), await read(vestAbi, good, 'totalScheduled'),
+       'and the scheduled total identical');
+    eq(await read(vestAbi, swapped, 'totalTgeUnlock'), await read(vestAbi, good, 'totalTgeUnlock'),
+       'and the TGE unlock identical');
+    ok(await read(vestAbi, swapped, 'scheduleHash') !== await read(vestAbi, good, 'scheduleHash'),
+       'but the schedule hash differs, which is the only thing that catches it');
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer',
+      [swapped.toString(), 30_000_000n * E18]) });
+    const r = await send({ from: 1, to: swapped, data: vestAbi.encodeFunctionData('seal',
+      [await read(vestAbi, good, 'beneficiaryCount'), await read(vestAbi, good, 'totalScheduled'),
+       await read(vestAbi, good, 'totalTgeUnlock'), await read(vestAbi, good, 'scheduleHash')]) });
+    ok(!!r.execResult.exceptionError,
+       'sealing a transposed load against the published commitment is refused');
+  }
+  {
+    // G-4  Missing the TGE date must not lock the balance forever. seal() has
+    //      no deadline; addSchedule is what closes at TGE.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const tge = now + 10n * DAY;
+    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+    // A one month cliff so the assertion below is not chasing a second of linear.
+    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[3].toString(), 1_000n * E18, 2500, 1, 12]) });
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 1_000n * E18]) });
+    const saved = now;
+    now = tge + 1n;
+    const late = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[4].toString(), 1n * E18, 10000, 0, 0]) });
+    ok(!!late.execResult.exceptionError, 'a schedule cannot be added at or after TGE');
+    const sealLate = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('seal',
+      [1n, 1_000n * E18, 250n * E18, await read(vestAbi, v, 'scheduleHash')]) });
+    ok(!sealLate.execResult.exceptionError, 'but the contract can still be sealed after TGE');
+    ok(await read(vestAbi, v, 'sealed_'), 'so a missed date is a delay, not a permanent loss');
+    const rel = await send({ from: 0, to: v, data: vestAbi.encodeFunctionData('release', [acc[3].toString()]) });
+    ok(!rel.execResult.exceptionError, 'and the beneficiary is paid');
+    eq(await read(tokenAbi, t, 'balanceOf', [acc[3].toString()]), 250n * E18,
+       'exactly the TGE unlock, so nothing extra was released by sealing late');
+    now = saved;
+  }
+  {
+    // G-5  The supply bound is snapshotted at construction, so a burn by any
+    //      holder cannot block the published table from being loaded.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const tge = now + 10n * DAY;
+    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [acc[5].toString(), 1n]) });
+    await send({ from: 5, to: t, data: tokenAbi.encodeFunctionData('burn', [1n]) });
+    ok(await read(tokenAbi, t, 'totalSupply') < 200_000_000n * E18, 'a holder burned one wei');
+    const r = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[3].toString(), 200_000_000n * E18, 0, 0, 12]) });
+    ok(!r.execResult.exceptionError, 'the full published total still loads after a burn');
+    const over = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[4].toString(), 1n * E18, 0, 0, 12]) });
+    ok(!!over.execResult.exceptionError, 'and scheduling past the snapshot is still refused');
+  }
+  {
+    // G-6  Ownership really is frozen by the seal, including a transfer that
+    //      was started before it.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const tge = now + 10n * DAY;
+    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[3].toString(), 1_000n * E18, 2500, 0, 12]) });
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 1_000n * E18]) });
+    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('transferOwnership', [acc[4].toString()]) });
+    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('seal',
+      [1n, 1_000n * E18, 250n * E18, await read(vestAbi, v, 'scheduleHash')]) });
+    const acc4 = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('acceptOwnership', []) });
+    ok(!!acc4.execResult.exceptionError, 'a transfer pending at the seal cannot be accepted afterwards');
+    eq((await read(vestAbi, v, 'owner')).toLowerCase(), acc[1].toString().toLowerCase(),
+       'the owner is unchanged');
+    eq((await read(vestAbi, v, 'pendingOwner')).toLowerCase(), '0x' + '00'.repeat(20),
+       'and seal() cleared the pending owner, so an explorer shows no live administrator');
+  }
+  {
+    // G-7  A TGE further out than a year is a typo, not a plan.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const r = await send({ to: null, data: load('HCOWVesting').bytecode +
+      vestAbi.encodeDeploy([t.toString(), now + 400n * DAY, acc[1].toString()]).slice(2) });
+    ok(!!r.execResult.exceptionError, 'a TGE more than a year out is refused at construction');
+  }
+
+  {
+    // G-8  Sealing must not be owner-only forever. A lost, frozen or simply
+    //      unwilling owner key otherwise holds every beneficiary's tokens with
+    //      no sweep and no recovery, which is the same total loss the seal
+    //      deadline used to cause, arriving by a different road.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const tge = now + 10n * DAY;
+    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[3].toString(), 1_000n * E18, 2500, 1, 12]) });
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 1_000n * E18]) });
+    const commit = [1n, 1_000n * E18, 250n * E18, await read(vestAbi, v, 'scheduleHash')];
+
+    const early = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('seal', commit) });
+    ok(!!early.execResult.exceptionError, 'before TGE only the owner can seal');
+
+    const saved = now;
+    now = tge + 1n;
+    const late = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('seal', commit) });
+    ok(!late.execResult.exceptionError, 'at or after TGE anyone can seal');
+    ok(await read(vestAbi, v, 'sealed_'), 'so a lost owner key is not a total loss');
+    const wrong = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('seal',
+      [2n, 1_000n * E18, 250n * E18, commit[3]]) });
+    ok(!!wrong.execResult.exceptionError, 'and a stranger still cannot seal against wrong figures');
+    now = saved;
+  }
+  {
+    // G-9  A token with nothing minted yet gives a zero supply cap, which
+    //      refuses every addSchedule and leaves a contract that can never be
+    //      finished, added to, or renounced.
+    const rt = await deploy('ReentrantToken', reAbi, []);
+    const r = await send({ to: null, data: load('HCOWVesting').bytecode +
+      vestAbi.encodeDeploy([rt.toString(), now + 10n * DAY, acc[1].toString()]).slice(2) });
+    ok(!!r.execResult.exceptionError, 'deploying against a token with zero supply is refused');
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

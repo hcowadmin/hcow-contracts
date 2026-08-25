@@ -20,11 +20,17 @@ import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20P
  *     is no admin key to lose or misuse. This is also the cheapest thing to
  *     audit.
  *
- *  3. NO TRANSFER TAX. The 20 percent fee burn and the 50 percent native
- *     payment burn described in the protocol documents are NOT implemented
- *     here. They are performed by protocol contracts that hold those amounts
- *     and call burn(). A transfer tax would break exchange listings, routers
- *     and accounting, and is not needed to achieve the same result.
+ *  3. NO TRANSFER TAX, AND NO BURN MECHANISM ANYWHERE. The 20 percent fee
+ *     burn and the 50 percent native payment burn described in older project
+ *     documents are NOT implemented here and are NOT implemented by any other
+ *     deployed contract either. Nothing calls burn(). The only on chain burn
+ *     in the system is the bonded deposit deduction in HCOWProfitShare, which
+ *     transfers to 0x...dEaD and therefore does not reduce totalSupply(): a
+ *     burned or circulating figure must read balanceOf(0xdEaD) rather than
+ *     subtract from supply. A transfer tax was rejected deliberately, because
+ *     it breaks exchange listings, routers and accounting. This comment is
+ *     published with the verified source, so it must not point a reader at an
+ *     implementation that does not exist.
  *
  *  4. THE SUPPLY GOES WHERE YOU TELL IT. The constructor takes `treasury` and
  *     mints the whole supply there. It does NOT mint to msg.sender. This means

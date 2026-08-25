@@ -1,21 +1,38 @@
 # HCOW Contracts — HCOWToken and HCOWVesting
 
 Reference implementations written by HashCow. Solidity 0.8.24, OpenZeppelin 5.0.2.
-Both compile clean with zero warnings and pass a 53-assertion suite.
+Both compile clean with zero warnings and pass 110 assertions.
 
 ```
+npm test           # compiles, then runs both suites below
 node compile.cjs   # solc 0.8.24, optimizer on, 200 runs
-node test.cjs      # functional suite, 53 assertions, in-process EVM
-node audit.cjs     # adversarial and property suite, 31 assertions
+node test.cjs      # functional suite, 54 assertions, in-process EVM
+node audit.cjs     # adversarial and property suite, 56 assertions
 ```
 
-An internal security review report is included in the handoff package under
-`01_문서`. Slither reports zero High and zero Medium findings on these two
-contracts once the three false positives are accounted for; the reasoning is in
-that report, section 4. Hand the report to the audit firm along with the source
-so they do not have to re-derive it.
+`npm test` compiles first, deliberately. `test.cjs` and `audit.cjs` read
+prebuilt artifacts from disk, so running them without compiling tests whatever
+was built last. That is not hypothetical: with the compile step missing, the
+`NotSealed` gate was deleted from the source and all 84 assertions still
+passed.
 
-Deployed sizes: HCOWToken 3,972 bytes, HCOWVesting 6,104 bytes. Limit is 24,576.
+There is no Slither run recorded against this revision. The last one was made
+against an earlier version of `HCOWVesting.sol` and reported zero High and
+three Medium, all `incorrect-equality` on zero checks of internally computed
+values. Quoting that result for the current source would be quoting a run that
+was not made, so it is stated as history rather than as a property. Re-run it
+before the audit engagement and record the output in the repository.
+
+Deployed sizes: HCOWToken 3,972 bytes, HCOWVesting 6,535 bytes. Limit is 24,576.
+
+These two contracts were reviewed for the first time on 25 August 2026, as part
+of a system-level pass across both repositories. That review found one Critical
+and three High findings here, all of them now fixed and all of them regression
+tested in `audit.cjs` section G. Section 14 of `SECURITY.md` in the
+`hcow-protocol` repository is the full write-up. **They must be inside the
+external audit scope**: about 220 lines of Solidity, excluding comments and
+blanks, that control 100% of the supply. Whatever a firm's line counting
+convention turns out to be, it is the cheapest 220 lines anyone will ever buy.
 
 ---
 
@@ -28,10 +45,16 @@ function and no minter role, so supply can only ever go down through burning.
 nothing to administer, so there is no admin key to lose or misuse. It is also
 the cheapest thing to audit.
 
-**No transfer tax.** The 20 percent fee burn and the 50 percent native payment
-burn are not implemented in the token. They are performed by protocol contracts
-that hold those amounts and call `burn()`. A transfer tax breaks routers,
-exchange listings and accounting, and is not needed to get the same result.
+**No transfer tax, and no burn mechanism anywhere.** The 20 percent fee burn
+and the 50 percent native payment burn described in older marketing material
+are **not implemented in any deployed contract**, here or in `hcow-protocol`.
+Nothing calls `token.burn()`. The only on-chain burn in the whole system is the
+bonded-deposit deduction in `HCOWProfitShare`, which transfers to
+`0x…dEaD` and therefore does **not** reduce `totalSupply()`: any circulating or
+burned figure must read `balanceOf(0xdEaD)` rather than subtracting from
+supply. A transfer tax was rejected deliberately, because it breaks routers,
+exchange listings and accounting. Do not restate the fee burn as a live
+mechanism in any document until something implements it.
 
 **The supply goes where you tell it.** The constructor takes a `treasury`
 address and mints the whole supply there. It does not mint to `msg.sender`.
@@ -56,9 +79,29 @@ explicitly so nobody has to guess.
 or reassigned. There is no revoke, cancel, sweep or emergency withdraw
 function, and the test suite asserts their absence.
 
-**The owner can only add schedules, and only until sealed.** After `seal()` no
-schedule can ever be added, by anyone, including the owner. Call `seal()`
-before TGE. From that moment the owner has no remaining power over the contract.
+**The owner can only add schedules, and only until sealed, and never at or
+after TGE.** After `seal()` no schedule can ever be added, by anyone, including
+the owner. From that moment the owner has no remaining power over the contract:
+`transferOwnership`, `acceptOwnership` and `renounceOwnership` are all refused,
+and `seal()` clears any pending owner.
+
+**`seal()` has no deadline.** `addSchedule` is what closes at `tgeTime`, which
+is where the danger was: a schedule written moments before a seal could
+otherwise unlock in the same block. Sealing itself must never become
+impossible, because `release()` is gated on it and there is no sweep. An
+earlier version refused to seal after `tgeTime`, which meant a missed calendar
+date locked the entire funded balance forever, with no recovery by anyone. Seal
+early anyway, for the reason at the end of the deployment order below, but a
+slip is now a delay rather than a total loss.
+
+**A schedule with no cliff and no linear period must unlock 100% at TGE.**
+`(total, 1500, 0, 0)` is refused, because with nothing left to vest it would
+release the whole allocation at TGE while `totalTgeUnlock()` reported fifteen
+percent. It is what a dropped fifth argument looks like. `(total, 10000, 0, 0)`
+is fine: it says what it does.
+
+**`totalTgeUnlock()` runs the real vesting maths**, not a sum of basis points,
+so the figure `seal()` commits to is the figure that actually releases.
 
 **Release is permissionless.** Anyone may call `release(beneficiary)`. Tokens
 always go to the beneficiary, never to the caller.
@@ -143,14 +186,57 @@ before deploying and check it against the published TGE circulating supply.
    amount: excess is permanently locked, there is no sweep. Confirm both
    `fundingShortfall()` is 0 and `token.balanceOf(vesting)` equals
    `totalScheduled()`.
-8. Call `seal(expectedBeneficiaries, expectedScheduled, expectedTgeUnlock)`
-   with the triple from step 6. The contract refuses to seal unless it agrees,
-   so the sign off becomes an on chain assertion rather than something read off
-   a screen at four in the morning.
+8. Call `seal(expectedBeneficiaries, expectedScheduled, expectedTgeUnlock,
+   expectedScheduleHash)` with the figures from step 6. The contract refuses to
+   seal unless all four agree, so the sign off becomes an on chain assertion
+   rather than something read off a screen at four in the morning.
 
-Funding comes before sealing, and sealing must happen before `tgeTime`; the
-contract enforces both. Step 6 is the last chance to fix a mistake and step 8
-removes the ability to make one.
+   The fourth argument is a running hash over every schedule, field by field,
+   in the order they were added. Read it from `scheduleHash()` after step 5 and
+   compare it against the value computed from the signed off table:
+
+   ```
+   h = 0x00...00
+   for each row, in the order it was added:
+     h = keccak256(abi.encodePacked(bytes32 h, address beneficiary,
+                                    uint128 total, uint16 tgeBps,
+                                    uint16 cliffMonths, uint16 linearMonths))
+   ```
+
+   **The widths matter and `total` is `uint128`, not `uint256`.**
+   `abi.encodePacked` is width sensitive: the contract packs 32 + 20 + 16 + 2 +
+   2 + 2 = 74 bytes per row. Computing it with a 256 bit `total`, which is what
+   the `ScheduleAdded` event declares and therefore the natural thing to reach
+   for, produces a different hash, `seal()` reverts `CommitmentMismatch`, and
+   the obvious four in the morning recovery is to read `scheduleHash()` off the
+   contract and paste it back in, which makes the fourth argument a tautology
+   and defeats the whole check. In ethers:
+
+   ```js
+   h = ethers.solidityPackedKeccak256(
+     ['bytes32', 'address', 'uint128', 'uint16', 'uint16', 'uint16'],
+     [h, beneficiary, total, tgeBps, cliffMonths, linearMonths]);
+   ```
+
+   The other three are all invariant under a transposition of `cliffMonths` and
+   `linearMonths`, which is the likeliest mistake in a five argument call with
+   two adjacent same typed arguments. Loaded that way, Seed's `cliff 0 /
+   linear 3` becomes `cliff 3 / linear 0` and drops 15,000,000 in one block,
+   while Team's lockup silently becomes 36 months of nothing, and the count,
+   the total and the TGE unlock are all still exactly right. This is the only
+   value that moves.
+
+Funding comes before sealing and the contract enforces that. Sealing itself has
+no deadline: `addSchedule` is what closes at `tgeTime`, so a date that slips is
+a delay rather than the permanent loss of everything the contract holds. Seal
+before TGE anyway, for the reason in the next paragraph. Step 6 is the last
+chance to fix a mistake and step 8 removes the ability to make one.
+
+From `tgeTime` onward `seal()` is permissionless. The table is frozen by then
+and all four commitments have to match figures that are already public, so the
+only thing another caller can do is finish a job that was left undone. That is
+deliberate: an owner key that is lost or frozen between funding and sealing
+would otherwise hold every beneficiary's tokens with no sweep and no recovery.
 
 **Do steps 7 and 8 in one signing session.** Between funding and sealing the
 owner key can write a schedule for itself at a full TGE unlock and take
@@ -165,7 +251,8 @@ eve of TGE, and it matters most when the treasury is a single key.
 
 | Item | Effect |
 |---|---|
-| TGE timestamp | Constructor argument. Must be in the future at deploy |
+| TGE timestamp | Constructor argument. Must be in the future and no more than a year out |
 | Beneficiary addresses | The tests use placeholders. Real addresses needed before step 5 |
 | Treasury custody | Single key or multisig. If single key, use a hardware wallet and fund and seal the vesting contract early to limit exposure |
+| Beneficiary cap | `MAX_BENEFICIARIES` is 200. The published allocation uses nine |
 | Audit firm and scope | The audit must cover the exact source that gets deployed, not an earlier revision |
