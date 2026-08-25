@@ -165,6 +165,18 @@ async function main() {
   }
 
   // seal
+  // An underfunded seal is irreversible and unrepairable: release() pays
+  // whoever asks first, so the early beneficiaries drain the balance and the
+  // rest revert forever, with no owner left to act.
+  {
+    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal') });
+    ok(!!r.execResult.exceptionError, 'sealing while underfunded reverts');
+  }
+  ok(!(await read(vestAbi, vest, 'sealed_')), 'and the flag is still unset');
+
+  await send({ from: 1, to: token, data: tokenAbi.encodeFunctionData('transfer', [vest.toString(), 1_000n * E18]) });
+  eq(await read(vestAbi, vest, 'fundingShortfall'), 0n, 'shortfall closed before sealing');
+
   await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal') });
   ok(await read(vestAbi, vest, 'sealed_'), 'seal() sets the sealed flag');
   {

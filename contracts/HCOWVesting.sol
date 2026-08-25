@@ -89,6 +89,7 @@ contract HCOWVesting is Ownable2Step {
     error NothingToRelease();
     error TgeInThePast();
     error ExceedsTokenSupply();
+    error NotFunded(uint256 required, uint256 held);
 
     /**
      * @param token_ HCOW token address.
@@ -155,9 +156,26 @@ contract HCOWVesting is Ownable2Step {
         }
     }
 
-    /// @notice Irreversible. Call before TGE. After this the owner has no power.
+    /**
+     * @notice Irreversible. Call before TGE. After this the owner has no power.
+     *
+     * @dev Sealing an underfunded contract cannot be undone and cannot be
+     *      repaired by anyone: release() pays whoever asks first, so early
+     *      beneficiaries drain the balance and the rest revert forever with no
+     *      owner left to act. The check is here rather than in a runbook
+     *      because the runbook is the thing that gets skipped at four in the
+     *      morning on TGE day.
+     *
+     *      It also closes the window this contract's owner key is exposed in:
+     *      before sealing, that key can add a schedule for itself at a full
+     *      TGE unlock and take the balance. Fund, verify, and seal in one
+     *      session, and that window is as short as the transactions take.
+     */
     function seal() external onlyOwner {
         if (sealed_) revert AlreadySealed();
+        uint256 owed = totalScheduled - totalReleased;
+        uint256 held = token.balanceOf(address(this));
+        if (held < owed) revert NotFunded(owed, held);
         sealed_ = true;
         emit Sealed(_beneficiaries.length, totalScheduled);
     }
