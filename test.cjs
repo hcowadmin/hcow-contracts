@@ -69,7 +69,7 @@ async function main() {
   const token = await deploy('HCOWToken', tokenAbi, [treasury.toString()]);
 
   eq(await read(tokenAbi, token, 'totalSupply'), 200_000_000n * E18, 'total supply is exactly 200,000,000');
-  eq(await read(tokenAbi, token, 'MAX_SUPPLY'), 200_000_000n * E18, 'MAX_SUPPLY constant matches');
+  eq(await read(tokenAbi, token, 'INITIAL_SUPPLY'), 200_000_000n * E18, 'INITIAL_SUPPLY constant matches');
   eq(await read(tokenAbi, token, 'balanceOf', [treasury.toString()]), 200_000_000n * E18,
      'entire supply goes to the treasury parameter, not to the deployer');
   eq(await read(tokenAbi, token, 'balanceOf', [acc[0].toString()]), 0n, 'deployer holds zero');
@@ -165,11 +165,19 @@ async function main() {
   }
 
   // seal
-  // An underfunded seal is irreversible and unrepairable: release() pays
-  // whoever asks first, so the early beneficiaries drain the balance and the
-  // rest revert forever, with no owner left to act.
+  // The caller states what it expects the loaded set to add up to. Reading the
+  // figures back and eyeballing them is the step that gets skipped, and the
+  // mistake it is meant to catch does not move either total.
+  const SEAL_ARGS = [9n, 200_000_000n * E18, 27_000_000n * E18];
+
+  // nothing may leave before the set is final
   {
-    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal') });
+    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('release', [holders[0].toString()]) });
+    ok(!!r.execResult.exceptionError, 'release before seal reverts');
+  }
+  // an underfunded seal is irreversible and unrepairable
+  {
+    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', SEAL_ARGS) });
     ok(!!r.execResult.exceptionError, 'sealing while underfunded reverts');
   }
   ok(!(await read(vestAbi, vest, 'sealed_')), 'and the flag is still unset');
@@ -177,7 +185,22 @@ async function main() {
   await send({ from: 1, to: token, data: tokenAbi.encodeFunctionData('transfer', [vest.toString(), 1_000n * E18]) });
   eq(await read(vestAbi, vest, 'fundingShortfall'), 0n, 'shortfall closed before sealing');
 
-  await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal') });
+  // a commitment that disagrees with what was loaded is refused, one field at a time
+  for (const [i, label] of [[0, 'beneficiary count'], [1, 'scheduled total'], [2, 'TGE unlock']]) {
+    const bad = [...SEAL_ARGS];
+    bad[i] = bad[i] + 1n;
+    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', bad) });
+    ok(!!r.execResult.exceptionError, `a wrong ${label} in the commitment refuses the seal`);
+  }
+  // and the merge the allocation table warns about: two community tranches as
+  // one entry leaves both totals correct and only the count wrong
+  {
+    const bad = [8n, SEAL_ARGS[1], SEAL_ARGS[2]];
+    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', bad) });
+    ok(!!r.execResult.exceptionError, 'a merged community tranche is caught by the count');
+  }
+
+  await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', SEAL_ARGS) });
   ok(await read(vestAbi, vest, 'sealed_'), 'seal() sets the sealed flag');
   {
     const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('addSchedule',

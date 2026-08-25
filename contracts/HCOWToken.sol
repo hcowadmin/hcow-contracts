@@ -40,7 +40,12 @@ import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20P
  */
 contract HCOWToken is ERC20, ERC20Burnable, ERC20Permit {
     /// @notice 200,000,000 HCOW, fixed forever.
-    uint256 public constant MAX_SUPPLY = 200_000_000 ether;
+    /// @notice The amount minted once at construction. Not a cap: there is no
+    ///         mint function, so supply can never rise, but `burn` can lower
+    ///         it, and from the first burn this constant no longer equals
+    ///         `totalSupply()`. Anything reporting a current maximum must read
+    ///         `totalSupply()`, not this.
+    uint256 public constant INITIAL_SUPPLY = 200_000_000 ether;
 
     error TreasuryIsZeroAddress();
 
@@ -51,6 +56,6 @@ contract HCOWToken is ERC20, ERC20Burnable, ERC20Permit {
      */
     constructor(address treasury) ERC20("HashCow", "HCOW") ERC20Permit("HashCow") {
         if (treasury == address(0)) revert TreasuryIsZeroAddress();
-        _mint(treasury, MAX_SUPPLY);
+        _mint(treasury, INITIAL_SUPPLY);
     }
 }

@@ -37,6 +37,14 @@ async function deploy(name, iface, args) {
   return r.createdAddress;
 }
 
+/** Seal with the commitment the contract has actually been loaded with. */
+async function sealNow(vestAbi, v) {
+  const n = await read(vestAbi, v, 'beneficiaryCount');
+  const t = await read(vestAbi, v, 'totalScheduled');
+  const g = await read(vestAbi, v, 'totalTgeUnlock');
+  return send({ to: v, data: vestAbi.encodeFunctionData('seal', [n, t, g]) });
+}
+
 async function main() {
   common = new Common({ chain: Chain.Mainnet, hardfork: Hardfork.Shanghai });
   vm = await VM.create({ common });
@@ -53,9 +61,16 @@ async function main() {
     const rt = await deploy('ReentrantToken', reAbi, []);
     const tge = now + 1n;
     const v = await deploy('HCOWVesting', vestAbi, [rt.toString(), tge, acc[0].toString()]);
-    await send({ to: rt, data: reAbi.encodeFunctionData('mint', [v.toString(), 1_000n * E18]) });
+    // Fund well above one schedule's total, and add a second schedule, so a
+    // successful re-entrant payout would actually be fundable. Minting exactly
+    // one schedule's worth makes the mock's own balance check do the work, and
+    // the test then passes against a contract with no ordering discipline at
+    // all: an interaction-first release() double-pays here and the assertion
+    // below still reads clean.
+    await send({ to: rt, data: reAbi.encodeFunctionData('mint', [v.toString(), 10_000n * E18]) });
     await send({ to: v, data: vestAbi.encodeFunctionData('addSchedule', [acc[1].toString(), 1_000n * E18, 5000, 0, 12]) });
-    await send({ to: v, data: vestAbi.encodeFunctionData('seal') });
+    await send({ to: v, data: vestAbi.encodeFunctionData('addSchedule', [acc[2].toString(), 9_000n * E18, 5000, 0, 12]) });
+    await sealNow(vestAbi, v);
     await send({ to: rt, data: reAbi.encodeFunctionData('arm', [v.toString(), acc[1].toString()]) });
     now = tge + 6n * MONTH;
     const r = await send({ to: v, data: vestAbi.encodeFunctionData('release', [acc[1].toString()]) });
@@ -90,7 +105,7 @@ async function main() {
     const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
     for (const [fn, args] of [
       ['addSchedule', [acc[3].toString(), 1n * E18, 0, 0, 1]],
-      ['seal', []],
+      ['seal', [1n, 1n, 0n]],
     ]) {
       const r = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData(fn, args) });
       ok(!!r.execResult.exceptionError, `a stranger cannot call ${fn}()`);

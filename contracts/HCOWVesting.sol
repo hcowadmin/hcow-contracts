@@ -90,6 +90,12 @@ contract HCOWVesting is Ownable2Step {
     error TgeInThePast();
     error ExceedsTokenSupply();
     error NotFunded(uint256 required, uint256 held);
+    error NotSealed();
+    error SealAfterTge();
+    error NoSchedules();
+    error CommitmentMismatch(uint256 scheduled, uint256 tgeUnlock);
+    error DegenerateSchedule();
+    error BadBeneficiary();
 
     /**
      * @param token_ HCOW token address.
@@ -115,8 +121,17 @@ contract HCOWVesting is Ownable2Step {
     ) public onlyOwner {
         if (sealed_) revert AlreadySealed();
         if (beneficiary == address(0)) revert ZeroAddress();
+        // This contract and the token itself both accept transfers, so a
+        // schedule pointing at either is paid out and lost with no error.
+        if (beneficiary == address(this) || beneficiary == address(token)) {
+            revert BadBeneficiary();
+        }
         if (total == 0) revert ZeroAmount();
         if (tgeBps > BPS) revert InvalidBps();
+        // All three zero is what a default initialised struct or a transposed
+        // argument looks like, and it means the whole allocation unlocks in the
+        // block it is added. Never a real schedule.
+        if (tgeBps == 0 && cliffMonths == 0 && linearMonths == 0) revert DegenerateSchedule();
         if (schedules[beneficiary].exists) revert ScheduleExists();
 
         schedules[beneficiary] = Schedule({
@@ -157,7 +172,16 @@ contract HCOWVesting is Ownable2Step {
     }
 
     /**
-     * @notice Irreversible. Call before TGE. After this the owner has no power.
+     * @notice Irreversible. After this the owner has no power.
+     *
+     * @dev The caller states what it expects the loaded schedule to add up to,
+     *      and the contract refuses to seal unless it agrees. Reading the two
+     *      figures back and eyeballing them is the step that gets skipped, and
+     *      the failure it is meant to catch does not move either of them: the
+     *      allocation table has two community tranches with different linear
+     *      periods, and merging them into one entry leaves totalScheduled and
+     *      totalTgeUnlock exactly right while the schedule is wrong. Passing
+     *      beneficiaryCount as well is what makes that visible.
      *
      * @dev Sealing an underfunded contract cannot be undone and cannot be
      *      repaired by anyone: release() pays whoever asks first, so early
@@ -171,11 +195,26 @@ contract HCOWVesting is Ownable2Step {
      *      TGE unlock and take the balance. Fund, verify, and seal in one
      *      session, and that window is as short as the transactions take.
      */
-    function seal() external onlyOwner {
+    function seal(
+        uint256 expectedBeneficiaries,
+        uint256 expectedScheduled,
+        uint256 expectedTgeUnlock
+    ) external onlyOwner {
         if (sealed_) revert AlreadySealed();
+        // Sealing after TGE would let a schedule written moments earlier unlock
+        // in the same block, which is the whole of the owner's remaining power.
+        if (block.timestamp >= tgeTime) revert SealAfterTge();
+        if (_beneficiaries.length == 0) revert NoSchedules();
+        if (
+            _beneficiaries.length != expectedBeneficiaries ||
+            totalScheduled != expectedScheduled ||
+            totalTgeUnlock() != expectedTgeUnlock
+        ) revert CommitmentMismatch(totalScheduled, totalTgeUnlock());
+
         uint256 owed = totalScheduled - totalReleased;
         uint256 held = token.balanceOf(address(this));
         if (held < owed) revert NotFunded(owed, held);
+
         sealed_ = true;
         emit Sealed(_beneficiaries.length, totalScheduled);
     }
@@ -184,6 +223,12 @@ contract HCOWVesting is Ownable2Step {
 
     /// @notice Permissionless. Tokens always go to `beneficiary`.
     function release(address beneficiary) external {
+        // Nothing leaves before the schedule set is final. Without this, the
+        // window between funding and sealing is one in which the owner can
+        // write a schedule for itself at a full unlock and walk out with
+        // whatever the contract holds above what is already committed.
+        if (!sealed_) revert NotSealed();
+
         Schedule storage s = schedules[beneficiary];
         if (!s.exists) revert NoSchedule();
 
@@ -199,6 +244,28 @@ contract HCOWVesting is Ownable2Step {
         emit Released(beneficiary, amount);
 
         token.safeTransfer(beneficiary, amount);
+    }
+
+    /**
+     * @dev Ownership is frozen once the schedule set is final.
+     *
+     * The claim made to holders is that after sealing nobody has any power over
+     * this contract. Leaving the ownership functions live does not create a
+     * fund risk, since no owner function does anything any more, but it leaves
+     * an owner address that can still be moved, which reads on an explorer as
+     * a live administrator and is exactly the sort of thing a listing review
+     * asks about. Make the claim true rather than nearly true.
+     */
+    function transferOwnership(address newOwner) public override onlyOwner {
+        if (sealed_) revert AlreadySealed();
+        super.transferOwnership(newOwner);
+    }
+
+    function renounceOwnership() public override onlyOwner {
+        // Before sealing this would make seal() uncallable forever, leaving a
+        // contract nobody can finish and nobody can add to. After sealing there
+        // is nothing left to renounce.
+        revert AlreadySealed();
     }
 
     // --------------------------------------------------------------- views
@@ -238,7 +305,7 @@ contract HCOWVesting is Ownable2Step {
 
     /// @notice Sum of every schedule's TGE unlock. Use this to verify the
     ///         published TGE circulating supply before deploying.
-    function totalTgeUnlock() external view returns (uint256 sum) {
+    function totalTgeUnlock() public view returns (uint256 sum) {
         uint256 n = _beneficiaries.length;
         for (uint256 i = 0; i < n; ++i) {
             Schedule memory s = schedules[_beneficiaries[i]];
