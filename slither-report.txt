@@ -1,0 +1,102 @@
+'forge clean' running (wd: /home/claude/vest)
+'forge config --json' running
+'forge build --build-info --deny never contracts' running (wd: /home/claude/vest)
+INFO:Detectors:
+Detector: incorrect-equality
+HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#362-380) uses a dangerous strict equality:
+	- remainder == 0 (contracts/HCOWVesting.sol#368)
+HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#362-380) uses a dangerous strict equality:
+	- duration == 0 (contracts/HCOWVesting.sol#374)
+HCOWVesting.release(address) (contracts/HCOWVesting.sol#303-325) uses a dangerous strict equality:
+	- amount == 0 (contracts/HCOWVesting.sol#314)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#dangerous-strict-equalities
+INFO:Detectors:
+Detector: missing-zero-check
+ReentrantToken.arm(address,address).vesting_ (contracts/test/Attackers.sol#23) lacks a zero-check on :
+		- vesting = vesting_ (contracts/test/Attackers.sol#23)
+ReentrantToken.arm(address,address).target_ (contracts/test/Attackers.sol#23) lacks a zero-check on :
+		- target = target_ (contracts/test/Attackers.sol#23)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#missing-zero-address-validation
+INFO:Detectors:
+Detector: reentrancy-benign
+Reentrancy in ReentrantToken.transfer(address,uint256) (contracts/test/Attackers.sol#25-37):
+	External calls:
+	- IVesting(vesting).release(target) (contracts/test/Attackers.sol#33-34)
+	State variables written after the call(s):
+	- reentrySucceeded = true (contracts/test/Attackers.sol#33)
+	- reentrySucceeded = false (contracts/test/Attackers.sol#34)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#reentrancy-vulnerabilities-3
+INFO:Detectors:
+Detector: timestamp
+HCOWVesting.constructor(address,uint256,address) (contracts/HCOWVesting.sol#135-150) uses timestamp for comparisons
+	Dangerous comparisons:
+	- tgeTime_ <= block.timestamp (contracts/HCOWVesting.sol#137)
+	- tgeTime_ > block.timestamp + MAX_TGE_HORIZON (contracts/HCOWVesting.sol#138)
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#154-204) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp >= tgeTime (contracts/HCOWVesting.sol#167)
+HCOWVesting.seal(uint256,uint256,uint256,bytes32) (contracts/HCOWVesting.sol#257-298) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp < tgeTime && msg.sender != owner() (contracts/HCOWVesting.sol#271)
+	- _beneficiaries.length != expectedBeneficiaries || totalScheduled != expectedScheduled || totalTgeUnlock() != expectedTgeUnlock || scheduleHash != expectedScheduleHash (contracts/HCOWVesting.sol#282-285)
+HCOWVesting.release(address) (contracts/HCOWVesting.sol#303-325) uses timestamp for comparisons
+	Dangerous comparisons:
+	- amount == 0 (contracts/HCOWVesting.sol#314)
+HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#362-380) uses timestamp for comparisons
+	Dangerous comparisons:
+	- ts < tgeTime (contracts/HCOWVesting.sol#364)
+	- remainder == 0 (contracts/HCOWVesting.sol#368)
+	- ts < cliffEnd (contracts/HCOWVesting.sol#371)
+	- duration == 0 (contracts/HCOWVesting.sol#374)
+	- elapsed >= duration (contracts/HCOWVesting.sol#377)
+HCOWVesting.fundingShortfall() (contracts/HCOWVesting.sol#387-391) uses timestamp for comparisons
+	Dangerous comparisons:
+	- held >= owed (contracts/HCOWVesting.sol#390)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#block-timestamp
+INFO:Detectors:
+Detector: pragma
+2 different versions of Solidity are used:
+	- Version constraint 0.8.24 is used by:
+		-0.8.24 (contracts/HCOWToken.sol#2)
+		-0.8.24 (contracts/HCOWVesting.sol#2)
+		-0.8.24 (contracts/test/Attackers.sol#2)
+	- Version constraint ^0.8.20 is used by:
+		-^0.8.20 (node_modules/@openzeppelin/contracts/access/Ownable.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/access/Ownable2Step.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/interfaces/IERC5267.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/interfaces/draft-IERC6093.sol#3)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/token/ERC20/ERC20.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/token/ERC20/IERC20.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/Address.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/Context.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/Nonces.sol#3)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/ShortStrings.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/StorageSlot.sol#5)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/Strings.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/cryptography/ECDSA.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/cryptography/EIP712.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/math/Math.sol#4)
+		-^0.8.20 (node_modules/@openzeppelin/contracts/utils/math/SignedMath.sol#4)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#different-pragma-directives-are-used
+INFO:Detectors:
+Detector: costly-loop
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#154-204) has costly operations inside a loop:
+	- totalScheduled += total (contracts/HCOWVesting.sol#195)
+	Calls stack containing the loop:
+		HCOWVesting.addSchedules(address[],uint128[],uint16[],uint16[],uint16[])
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#154-204) has costly operations inside a loop:
+	- scheduleHash = keccak256(bytes)(abi.encodePacked(scheduleHash,beneficiary,total,tgeBps,cliffMonths,linearMonths)) (contracts/HCOWVesting.sol#199-201)
+	Calls stack containing the loop:
+		HCOWVesting.addSchedules(address[],uint128[],uint16[],uint16[],uint16[])
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#costly-operations-inside-a-loop
+INFO:Detectors:
+Detector: missing-inheritance
+HCOWVesting (contracts/HCOWVesting.sol#50-416) should inherit from IVesting (contracts/test/Attackers.sol#6-9)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#missing-inheritance
+INFO:Slither:contracts/ analyzed (30 contracts with 102 detectors), 16 result(s) found

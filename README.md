@@ -4,11 +4,29 @@ Reference implementations written by HashCow. Solidity 0.8.24, OpenZeppelin 5.0.
 Both compile clean with zero warnings and pass 110 assertions.
 
 ```
-npm test           # compiles, then runs both suites below
+npm test           # compiles, runs both suites below, then forge test
 node compile.cjs   # solc 0.8.24, optimizer on, 200 runs
 node test.cjs      # functional suite, 54 assertions, in-process EVM
 node audit.cjs     # adversarial and property suite, 56 assertions
+forge test         # 13 machine-searched invariants + 3 tests, 32,768 calls each
+npm run test:fuzz:deep   # the same, 2000 runs x 400 calls
 ```
+
+`forge test` needs the Foundry standard library once, because it is not
+committed:
+
+```bash
+git clone --depth 1 https://github.com/foundry-rs/forge-std foundry/lib/forge-std
+```
+
+The Foundry suite is not more of the same. The two suites above replay
+sequences their author thought of, and a sequence nobody thought of is not
+tested. `foundry/` states the properties instead and lets a machine look for
+counterexamples, in both phases: the sealed contract, and the loading phase
+where an irreversible mistake about 200,000,000 tokens gets made.
+
+Before trusting any property, delete the guard it claims to protect and check
+that it fails. That is how the gaps in this suite were found.
 
 `npm test` compiles first, deliberately. `test.cjs` and `audit.cjs` read
 prebuilt artifacts from disk, so running them without compiling tests whatever
@@ -16,12 +34,18 @@ was built last. That is not hypothetical: with the compile step missing, the
 `NotSealed` gate was deleted from the source and all 84 assertions still
 passed.
 
-There is no Slither run recorded against this revision. The last one was made
-against an earlier version of `HCOWVesting.sol` and reported zero High and
-three Medium, all `incorrect-equality` on zero checks of internally computed
-values. Quoting that result for the current source would be quoting a run that
-was not made, so it is stated as history rather than as a property. Re-run it
-before the audit engagement and record the output in the repository.
+Slither, run against this revision and committed as `slither-report.txt`:
+16 results across 7 detectors, **zero High and zero Medium**. The three that
+look like findings are a missing zero-check inside the test doubles, a
+`missing-inheritance` note about the interface those doubles declare, and a
+`costly-loop` on `addSchedule` inside `addSchedules` — which is bounded at
+`MAX_BENEFICIARIES` and whose worst case is measured rather than argued:
+sealing a full two-hundred-schedule table costs 458,729 gas.
+
+```
+slither contracts/ --solc /usr/local/bin/solc-0.8.24 \
+  --solc-remaps "@openzeppelin/=node_modules/@openzeppelin/" --exclude-dependencies
+```
 
 Deployed sizes: HCOWToken 3,972 bytes, HCOWVesting 6,535 bytes. Limit is 24,576.
 

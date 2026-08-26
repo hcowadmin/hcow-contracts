@@ -1,0 +1,26 @@
+# Foundry sits alongside the existing in-process EVM harness. compile.cjs still
+# produces the artifacts that test.cjs and audit.cjs use, and this is here for
+# the one thing those cannot do: let a machine search the state space instead
+# of replaying sequences their author thought of.
+[profile.default]
+src = "contracts"
+test = "foundry"
+out = "foundry-out"
+cache_path = "foundry-cache"
+libs = ["node_modules", "foundry/lib"]
+solc = "/usr/local/bin/solc-0.8.24"
+optimizer = true
+optimizer_runs = 200
+remappings = ["@openzeppelin/=node_modules/@openzeppelin/", "forge-std/=foundry/lib/forge-std/src/"]
+
+[profile.default.invariant]
+runs = 256
+depth = 128
+fail_on_revert = false
+shrink_run_limit = 5000
+
+[profile.deep.invariant]
+runs = 2000
+depth = 400
+fail_on_revert = false
+shrink_run_limit = 20000
