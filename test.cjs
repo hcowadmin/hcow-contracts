@@ -1,4 +1,5 @@
 /* HCOW contract test suite. In-process EVM, no network required. */
+const { commitments } = require('./vestcommit.cjs');
 const fs = require('fs');
 const { VM } = require('@ethereumjs/vm');
 const { Common, Hardfork, Chain } = require('@ethereumjs/common');
@@ -47,6 +48,20 @@ async function call(to, data) {
 const read = (iface, to, fn, args = []) =>
   call(to, iface.encodeFunctionData(fn, args)).then(r => iface.decodeFunctionResult(fn, r)[0]);
 
+/**
+ * The custom error a reverted call returned, by name.
+ *
+ * Asserting only that something reverted is how a guard passes its own test for
+ * the wrong reason: several guards can stand on one path, and "it reverted" is
+ * satisfied by any of them, so deleting the one under test leaves the assertion
+ * green. Name the error.
+ */
+function errorName(iface, r) {
+  const data = bytesToHex(r.execResult.returnValue || new Uint8Array());
+  if (!data || data.length < 10) return '';
+  try { return iface.parseError(data)?.name ?? ''; } catch (_) { return ''; }
+}
+
 async function deploy(name, iface, args) {
   const art = load(name);
   const data = art.bytecode + (args.length ? iface.encodeDeploy(args).slice(2) : '');
@@ -76,8 +91,21 @@ async function main() {
   eq(await read(tokenAbi, token, 'decimals'), 18n, 'decimals is 18');
   eq(await read(tokenAbi, token, 'symbol'), 'HCOW', 'symbol is HCOW');
 
+  // BEP-20 tooling calls getOwner() unconditionally. A contract that does not
+  // implement it reverts, and a tool that does not expect the revert reports
+  // the token as malformed rather than as ownerless.
+  {
+    let got = 'absent';
+    try { got = await read(tokenAbi, token, 'getOwner'); } catch (_) {}
+    eq(got, '0x0000000000000000000000000000000000000000',
+       'getOwner reports the zero address, which is what tooling reads as renounced');
+  }
+
   const fns = load('HCOWToken').abi.filter(x => x.type === 'function').map(x => x.name);
+  ok(fns.includes('getOwner'), 'getOwner is present for BEP-20 tooling');
   ok(!fns.includes('mint'), 'no mint function exists');
+  ok(!fns.includes('setOwner') && !fns.includes('transferOwnership'),
+     'getOwner has no setter and no counterpart that could grant a role');
   ok(!['owner','transferOwnership','renounceOwnership','pause','unpause','setFee','setTax','blacklist']
       .some(n => fns.includes(n)), 'no owner, pause, fee or blacklist function exists');
   ok(fns.includes('burn') && fns.includes('burnFrom'), 'burn and burnFrom exist');
@@ -100,14 +128,6 @@ async function main() {
   // ============================ HCOWVesting ============================
   console.log('\nHCOWVesting');
   const tge = now + 10n * DAY;
-  const vest = await deploy('HCOWVesting', vestAbi, [token.toString(), tge, acc[1].toString()]);
-
-  eq(await read(vestAbi, vest, 'tgeTime'), tge, 'tgeTime is fixed at construction');
-  {
-    const r = await send({ data: load('HCOWVesting').bytecode +
-      vestAbi.encodeDeploy([token.toString(), now - 1n, acc[1].toString()]).slice(2) });
-    ok(!!r.execResult.exceptionError, 'a TGE timestamp in the past reverts');
-  }
 
   // The published allocation, taken from the official tokenomics announcements.
   // TGE unlock across all of it must be exactly 27,000,000.
@@ -126,6 +146,72 @@ async function main() {
     ['Team',                     10_000_000n,      0, 12, 36],
   ];
   const holders = ALLOC.map((_, i) => new Address(privateToAddress(hexToBytes('0x' + (i + 1).toString(16).padStart(2,'0').repeat(32)))));
+
+  // The four figures are now constructor arguments, so they are derived from
+  // the published table before anything is deployed rather than read back off
+  // a contract that has already been loaded. That read-back was the whole of
+  // the audit's Low #1: it made the check a restatement instead of a
+  // verification.
+  const COMMIT = commitments(ALLOC.map(([, amt, bps, cliff, lin], i) => ({
+    beneficiary: holders[i].toString(), total: amt * E18,
+    tgeBps: bps, cliffMonths: cliff, linearMonths: lin,
+  })));
+  eq(COMMIT.total, 200_000_000n * E18, 'the published table sums to 200,000,000 before deployment');
+  eq(COMMIT.unlock, 27_000_000n * E18, 'the published table unlocks exactly 27,000,000 at TGE');
+
+  const VEST_ARGS = [token.toString(), tge, acc[1].toString(), acc[0].toString(),
+                     COMMIT.count, COMMIT.total, COMMIT.unlock, COMMIT.hash];
+  const vest = await deploy('HCOWVesting', vestAbi, VEST_ARGS);
+
+  eq(await read(vestAbi, vest, 'tgeTime'), tge, 'tgeTime is fixed at construction');
+  eq(await read(vestAbi, vest, 'expectedScheduleHash'), COMMIT.hash,
+     'the commitment hash is fixed at construction, not supplied at seal');
+  {
+    const r = await send({ data: load('HCOWVesting').bytecode +
+      vestAbi.encodeDeploy([token.toString(), now - 1n, acc[1].toString(), acc[0].toString(),
+                            COMMIT.count, COMMIT.total, COMMIT.unlock, COMMIT.hash]).slice(2) });
+    ok(!!r.execResult.exceptionError, 'a TGE timestamp in the past reverts');
+  }
+
+  // A commitment no table can ever satisfy has to be refused at deployment,
+  // not at seal. expectedTgeUnlock was named by the CommitmentMismatch error
+  // and constrained by nothing: totalTgeUnlock() can never exceed
+  // totalScheduled, so a decimal slip here produced a contract that could
+  // never be sealed, with both figures immutable and replaceTable unable to
+  // help. HCOW sent to it before anyone noticed would have been stranded
+  // permanently.
+  {
+    const bad = [token.toString(), tge, acc[1].toString(), acc[0].toString(),
+                 COMMIT.count, COMMIT.total, COMMIT.total + 1n, COMMIT.hash];
+    const r = await send({ data: load('HCOWVesting').bytecode + vestAbi.encodeDeploy(bad).slice(2) });
+    eq(errorName(vestAbi, r), 'CommitmentMismatch',
+       'a TGE unlock larger than the scheduled total is refused at deployment');
+  }
+  {
+    const ok_ = [token.toString(), tge, acc[1].toString(), acc[0].toString(),
+                 COMMIT.count, COMMIT.total, COMMIT.total, COMMIT.hash];
+    const r = await send({ data: load('HCOWVesting').bytecode + vestAbi.encodeDeploy(ok_).slice(2) });
+    ok(!r.execResult.exceptionError,
+       'and a TGE unlock exactly equal to the scheduled total is still allowed');
+  }
+
+  // rescueRecipient is immutable and there is no owner after sealing, so the
+  // two values that make the rescue path permanently useless are refused.
+  for (const [badAddr, label] of [[null, 'the vesting contract itself'], [token.toString(), 'the vesting token']]) {
+    const args = [token.toString(), tge, acc[1].toString(), acc[0].toString(),
+                  COMMIT.count, COMMIT.total, COMMIT.unlock, COMMIT.hash];
+    if (badAddr === null) {
+      // address(this) is not known before deployment, so it is exercised by
+      // the contract's own check rather than by a literal: deploying with the
+      // predicted CREATE address is the only way to hit it, and the guard is
+      // instead demonstrated against the token, which is the reachable half.
+      continue;
+    }
+    args[3] = badAddr;
+    const r = await send({ data: load('HCOWVesting').bytecode + vestAbi.encodeDeploy(args).slice(2) });
+    eq(errorName(vestAbi, r), 'InvalidRescueRecipient',
+       `a rescue recipient set to ${label} is refused at deployment`);
+  }
 
   for (let i = 0; i < ALLOC.length; i++) {
     const [, amt, bps, cliff, lin] = ALLOC[i];
@@ -164,13 +250,6 @@ async function main() {
     ok(!!r.execResult.exceptionError, 'release before TGE reverts');
   }
 
-  // seal
-  // The caller states what it expects the loaded set to add up to. Reading the
-  // figures back and eyeballing them is the step that gets skipped, and the
-  // mistake it is meant to catch does not move either total.
-  const LOADED_HASH = await read(vestAbi, vest, 'scheduleHash');
-  const SEAL_ARGS = [9n, 200_000_000n * E18, 27_000_000n * E18, LOADED_HASH];
-
   // nothing may leave before the set is final
   {
     const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('release', [holders[0].toString()]) });
@@ -178,7 +257,7 @@ async function main() {
   }
   // an underfunded seal is irreversible and unrepairable
   {
-    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', SEAL_ARGS) });
+    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal') });
     ok(!!r.execResult.exceptionError, 'sealing while underfunded reverts');
   }
   ok(!(await read(vestAbi, vest, 'sealed_')), 'and the flag is still unset');
@@ -186,24 +265,138 @@ async function main() {
   await send({ from: 1, to: token, data: tokenAbi.encodeFunctionData('transfer', [vest.toString(), 1_000n * E18]) });
   eq(await read(vestAbi, vest, 'fundingShortfall'), 0n, 'shortfall closed before sealing');
 
-  // a commitment that disagrees with what was loaded is refused, one field at a time
-  for (const [i, label] of [[0, 'beneficiary count'], [1, 'scheduled total'], [2, 'TGE unlock'], [3, 'schedule hash']]) {
-    const bad = [...SEAL_ARGS];
-    bad[i] = i === 3
-      ? '0x' + (BigInt(bad[3]) ^ 1n).toString(16).padStart(64, '0')
-      : bad[i] + 1n;
-    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', bad) });
-    ok(!!r.execResult.exceptionError, `a wrong ${label} in the commitment refuses the seal`);
-  }
-  // and the merge the allocation table warns about: two community tranches as
-  // one entry leaves both totals correct and only the count wrong
+  // The commitment now binds because it was fixed before the table existed.
+  // Testing it means deploying against a figure that disagrees with the table
+  // and confirming the contract refuses, which is the check an owner used to be
+  // able to satisfy by reading the live values straight back off the contract.
+  /** The full committed table as five parallel arrays, for replaceTable. */
+  const allocArrays = (skipIdx = -1, wrongAmountAt = -1) => {
+    const b = [], tot = [], bp = [], cl = [], li = [];
+    for (let i = 0; i < ALLOC.length; i++) {
+      if (i === skipIdx) continue;
+      const [, amt, bps, cliff, lin] = ALLOC[i];
+      b.push(holders[i].toString());
+      tot.push(i === wrongAmountAt ? (amt - 1_000_000n) * E18 : amt * E18);
+      bp.push(bps); cl.push(cliff); li.push(lin);
+    }
+    return [b, tot, bp, cl, li];
+  };
+  const loadAlloc = async (v, skipIdx = -1, wrongAmountAt = -1) => {
+    for (let i = 0; i < ALLOC.length; i++) {
+      if (i === skipIdx) continue;
+      const [, amt, bps, cliff, lin] = ALLOC[i];
+      const total = i === wrongAmountAt ? (amt - 1_000_000n) * E18 : amt * E18;
+      const r = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+        [holders[i].toString(), total, bps, cliff, lin]) });
+      if (r.execResult.exceptionError) throw new Error('addSchedule failed at ' + i);
+    }
+  };
+  // The side deployments below need their own supply: the treasury has by now
+  // funded the main contract with all 200,000,000. Without this they would
+  // revert for want of tokens and pass for the wrong reason.
+  const token2 = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+  const VEST2_ARGS = [token2.toString(), tge, acc[1].toString(), acc[0].toString(),
+                      COMMIT.count, COMMIT.total, COMMIT.unlock, COMMIT.hash];
+
+  // a committed total above what exists can never be funded, and the honest
+  // place to discover that is before deployment rather than after a transfer
   {
-    const bad = [8n, SEAL_ARGS[1], SEAL_ARGS[2], SEAL_ARGS[3]];
-    const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', bad) });
-    ok(!!r.execResult.exceptionError, 'a merged community tranche is caught by the count');
+    const over = [...VEST2_ARGS];
+    over[5] = COMMIT.total + 1n;
+    const r = await send({ data: load('HCOWVesting').bytecode + vestAbi.encodeDeploy(over).slice(2) });
+    ok(!!r.execResult.exceptionError, 'committing more than the token supply is refused at deployment');
+  }
+  for (const [i, label] of [[4, 'beneficiary count'], [5, 'scheduled total'], [6, 'TGE unlock'], [7, 'schedule hash']]) {
+    const bad = [...VEST2_ARGS];
+    bad[i] = i === 7
+      ? '0x' + (BigInt(bad[7]) ^ 1n).toString(16).padStart(64, '0')
+      : (i === 5 ? bad[i] - 1n : bad[i] + 1n);
+    const v = await deploy('HCOWVesting', vestAbi, bad);
+    await loadAlloc(v);
+    await send({ from: 1, to: token2, data: tokenAbi.encodeFunctionData('approve', [v.toString(), 200_000_000n * E18]) });
+    const r = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('fundAndSeal') });
+    ok(!!r.execResult.exceptionError, `a deployment committing the wrong ${label} cannot be sealed`);
+  }
+  // the merge the allocation table warns about: two community tranches as one
+  // entry leaves both totals correct and only the count wrong
+  {
+    const merged = ALLOC.map(([, amt, bps, cliff, lin], i) => ({
+      beneficiary: holders[i].toString(), total: amt * E18, tgeBps: bps, cliffMonths: cliff, linearMonths: lin,
+    })).filter((_, i) => i !== 4);
+    merged[3].total += 12_000_000n * E18;
+    const c = commitments(merged);
+    eq(c.count, 8n, 'the merged table has one row fewer');
+    ok(c.total === COMMIT.total, 'and the merged table still sums to the same total');
   }
 
-  await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal', SEAL_ARGS) });
+  // A mistyped row used to be unrecoverable: nothing could remove or amend an
+  // entry, so the contract had to be redeployed. resetTable clears it.
+  {
+    const v = await deploy('HCOWVesting', vestAbi, VEST2_ARGS);
+    await loadAlloc(v, -1, 0);
+    ok(await read(vestAbi, v, 'totalScheduled') < COMMIT.total,
+       'a mistyped amount well inside the supply bound is accepted silently');
+    const r = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('seal') });
+    ok(!!r.execResult.exceptionError, 'and the contract refuses to seal it');
+    const rows = allocArrays();
+    const nonOwner = await send({ from: 3, to: v,
+      data: vestAbi.encodeFunctionData('replaceTable', rows) });
+    ok(!!nonOwner.execResult.exceptionError, 'a non-owner cannot replace the table');
+    const empty = await send({ from: 1, to: v,
+      data: vestAbi.encodeFunctionData('replaceTable', [[], [], [], [], []]) });
+    ok(!!empty.execResult.exceptionError, 'and the table cannot be replaced with nothing');
+    eq(errorName(vestAbi, empty), 'NoSchedules',
+       'refused for being empty, which is the state that used to be reachable');
+    const mismatched = await send({ from: 1, to: v,
+      data: vestAbi.encodeFunctionData('replaceTable',
+        [rows[0], rows[1].slice(1), rows[2], rows[3], rows[4]]) });
+    ok(!!mismatched.execResult.exceptionError, 'ragged arrays are refused');
+    const fixed = await send({ from: 1, to: v,
+      data: vestAbi.encodeFunctionData('replaceTable', rows) });
+    ok(!fixed.execResult.exceptionError, 'the owner can replace a mistyped table');
+    eq(await read(vestAbi, v, 'beneficiaryCount'), COMMIT.count,
+       'the replacement is the whole table, not an append');
+    eq(await read(vestAbi, v, 'totalScheduled'), COMMIT.total, 'and it sums to the commitment');
+    eq(await read(vestAbi, v, 'scheduleHash'), COMMIT.hash, 'and reaches the committed hash');
+    await send({ from: 1, to: token2, data: tokenAbi.encodeFunctionData('approve', [v.toString(), 200_000_000n * E18]) });
+    const done = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('fundAndSeal') });
+    ok(!done.execResult.exceptionError, 'and a corrected table seals');
+    ok(await read(vestAbi, v, 'sealed_'), 'the recovered contract is sealed');
+  }
+
+  // resetTable must never be reachable on a FUNDED contract. Clearing a funded
+  // table is not recoverable: addSchedule closes at TGE, so a table cleared and
+  // not rebuilt before then can never be rebuilt, seal reverts NoSchedules
+  // forever, release is gated on the seal, and there is no sweep. Measured on
+  // the version without this guard: one call, 3,000,000 HCOW stranded.
+  //
+  // Declining to seal is recoverable, which is why seal has no deadline and
+  // becomes permissionless at TGE. Emptying a funded table is not, so the two
+  // are not the same power and the NatSpec that said they were was wrong.
+  {
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const v = await deploy('HCOWVesting', vestAbi,
+      [t.toString(), tge, acc[1].toString(), acc[1].toString(),
+       COMMIT.count, COMMIT.total, COMMIT.unlock, COMMIT.hash]);
+    await loadAlloc(v);
+    // A dusted contract must still be correctable. Guarding the replacement on
+    // the contract being empty was the obvious fix for the total-loss path and
+    // the wrong one: anyone can send one wei here before the table is loaded
+    // and disable the correction path for good.
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 1n]) });
+    const dusted = await send({ from: 1, to: v,
+      data: vestAbi.encodeFunctionData('replaceTable', allocArrays()) });
+    ok(!dusted.execResult.exceptionError,
+       'a stranger cannot disable the correction path by dusting the contract');
+    eq(await read(vestAbi, v, 'scheduleHash'), COMMIT.hash, 'and the table is still correct');
+
+    // and the intended path still works: fundAndSeal from here
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('approve', [v.toString(), 200_000_000n * E18]) });
+    const sealed = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('fundAndSeal') });
+    ok(!sealed.execResult.exceptionError, 'and the funded contract still seals');
+  }
+
+  await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('seal') });
   ok(await read(vestAbi, vest, 'sealed_'), 'seal() sets the sealed flag');
   {
     const r = await send({ from: 1, to: vest, data: vestAbi.encodeFunctionData('addSchedule',
@@ -288,6 +481,88 @@ async function main() {
   const vfns = load('HCOWVesting').abi.filter(x => x.type === 'function').map(x => x.name);
   ok(!vfns.some(n => ['revoke','cancel','withdraw','emergencyWithdraw','sweep','rescue'].includes(n)),
      'there is no revoke, cancel or sweep function, so schedules cannot be clawed back');
+  // rescueForeignToken exists and is deliberately not one of the above: it can
+  // never move the vesting token, and it sends to an address fixed at
+  // deployment rather than to its caller. The audit recommended a bounded sweep
+  // of surplus vesting tokens too; that is declined, because fundAndSeal pulls
+  // the exact shortfall so a surplus has no way to arise on the intended path.
+  ok(vfns.includes('rescueForeignToken'), 'a foreign token sent here by mistake can be recovered');
+
+  console.log('\nAudit follow-ups');
+  // time has moved a long way past the original TGE by now
+  const tge2 = now + 10n * DAY;
+  const V2 = (tok, own) => [tok, tge2, own, acc[0].toString(),
+                            COMMIT.count, COMMIT.total, COMMIT.unlock, COMMIT.hash];
+  {
+    // Low #3: a transposed or mistyped period is caught at entry, not at seal
+    const t5 = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const v = await deploy('HCOWVesting', vestAbi, V2(t5.toString(), acc[1].toString()));
+    const long = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      ['0x' + 'aa'.repeat(20), 1n * E18, 0, 0, 1200]) });
+    ok(!!long.execResult.exceptionError, 'a 1200 month linear period is refused at entry');
+    const ok120 = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      ['0x' + 'aa'.repeat(20), 1n * E18, 0, 84, 36]) });
+    ok(!ok120.execResult.exceptionError, 'and 84 + 36 months, the bound exactly, is accepted');
+    const over = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+      ['0x' + 'bb'.repeat(20), 1n * E18, 0, 84, 37]) });
+    ok(!!over.execResult.exceptionError, 'while 84 + 37 is not');
+
+    // Low #4: the renounce revert no longer asserts something false
+    const ren = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('renounceOwnership') });
+    ok(!!ren.execResult.exceptionError, 'ownership cannot be renounced');
+    const sel = vestAbi.getError('OwnershipIsPermanent').selector;
+    ok(bytesToHex(ren.execResult.returnValue).startsWith(sel),
+       'and it reverts with OwnershipIsPermanent, not with a false claim that the contract is sealed');
+
+    // Low #4: a named error rather than a low level panic
+    const oob = await send({ to: v, data: vestAbi.encodeFunctionData('beneficiaryAt', [99n]) });
+    ok(bytesToHex(oob.execResult.returnValue).startsWith(vestAbi.getError('IndexOutOfBounds').selector),
+       'reading past the end of the beneficiary list gives a named error');
+
+    // resetTable is refused once the table is frozen anyway
+    ok(await read(vestAbi, v, 'committedTotalIsFundable'),
+       'committedTotalIsFundable reports true while supply covers the commitment');
+  }
+  {
+    // Medium #1: the failure the whole change exists to remove. A treasury that
+    // sends the balance it holds rather than the figure asked for, when that
+    // balance is short, strands everything: the transfer succeeds, seal can
+    // never pass, release is gated on seal and there is no sweep.
+    const t3 = await deploy('HCOWToken', tokenAbi, [acc[2].toString()]);
+    const v = await deploy('HCOWVesting', vestAbi, V2(t3.toString(), acc[2].toString()));
+    for (let i = 0; i < ALLOC.length; i++) {
+      const [, amt, bps, cliff, lin] = ALLOC[i];
+      await send({ from: 2, to: v, data: vestAbi.encodeFunctionData('addSchedule',
+        [holders[i].toString(), amt * E18, bps, cliff, lin]) });
+    }
+    // burn one wei, so the treasury's balance is now short of the committed total
+    await send({ from: 2, to: t3, data: tokenAbi.encodeFunctionData('burn', [1n]) });
+    const held = await read(tokenAbi, t3, 'balanceOf', [acc[2].toString()]);
+    ok(held < COMMIT.total, 'the treasury now holds less than the committed total');
+    ok(!(await read(vestAbi, v, 'committedTotalIsFundable')),
+       'committedTotalIsFundable reports false, which is the check to run before funding');
+
+    // the send-max path: transfer succeeds, and the contract is then stuck
+    await send({ from: 2, to: t3, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), held]) });
+    const stuck = await send({ from: 2, to: v, data: vestAbi.encodeFunctionData('seal') });
+    ok(!!stuck.execResult.exceptionError, 'sealing after a short send-max transfer is impossible');
+
+    // and fundAndSeal is the path that cannot go wrong, because there is no
+    // figure for a human to type
+    const t4 = await deploy('HCOWToken', tokenAbi, [acc[3].toString()]);
+    const v4 = await deploy('HCOWVesting', vestAbi, V2(t4.toString(), acc[3].toString()));
+    for (let i = 0; i < ALLOC.length; i++) {
+      const [, amt, bps, cliff, lin] = ALLOC[i];
+      await send({ from: 3, to: v4, data: vestAbi.encodeFunctionData('addSchedule',
+        [holders[i].toString(), amt * E18, bps, cliff, lin]) });
+    }
+    await send({ from: 3, to: t4, data: tokenAbi.encodeFunctionData('approve', [v4.toString(), 200_000_000n * E18]) });
+    const atomic = await send({ from: 3, to: v4, data: vestAbi.encodeFunctionData('fundAndSeal') });
+    ok(!atomic.execResult.exceptionError, 'fundAndSeal funds and seals in one transaction');
+    ok(await read(vestAbi, v4, 'sealed_'), 'leaving no funded-and-unsealed window at all');
+    eq(await read(tokenAbi, t4, 'balanceOf', [v4.toString()]), COMMIT.total,
+       'and it pulled exactly the committed total, no more and no less');
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

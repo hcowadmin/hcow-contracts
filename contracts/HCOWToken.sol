@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity 0.8.34;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
@@ -43,6 +43,31 @@ import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20P
  *
  *  5. ERC20Permit is included so that future protocol contracts can accept
  *     signature-based approvals. It adds no privileged role.
+ *
+ *  6. GENESIS CONCENTRATION, AND HOW IT IS RETIRED. At the moment this
+ *     constructor returns, one address holds 100 percent of the supply. That
+ *     is a real exposure for as long as it lasts, and it cannot be removed by
+ *     the token: any mechanism that could would be an admin power, which is
+ *     what point 2 refuses. It is retired by the deployment procedure instead,
+ *     and the procedure is stated here because a reader of the verified source
+ *     should be able to see what the mitigation actually is:
+ *
+ *       - `treasury` is a hardware wallet, and no key material for it is ever
+ *         present on a machine that runs a package installer or opens a
+ *         repository from a third party.
+ *       - The vesting contract is deployed with its schedule already committed
+ *         in its constructor, then funded and sealed in ONE transaction, using
+ *         HCOWVesting.fundAndSeal. After that transaction the vesting contract
+ *         holds everything it will ever owe and nobody, including its own
+ *         owner, can change the table.
+ *       - The window between this constructor and that transaction is the
+ *         entire duration of the exposure, and it is measured in minutes on a
+ *         prepared runbook rather than left open.
+ *       - No burn occurs in that window, so the committed total cannot exceed
+ *         live supply.
+ *
+ *     What remains after that is ordinary treasury custody of whatever is not
+ *     under vesting, which is a custody question rather than a token one.
  */
 contract HCOWToken is ERC20, ERC20Burnable, ERC20Permit {
     /// @notice 200,000,000 HCOW, fixed forever.
@@ -63,5 +88,23 @@ contract HCOWToken is ERC20, ERC20Burnable, ERC20Permit {
     constructor(address treasury) ERC20("HashCow", "HCOW") ERC20Permit("HashCow") {
         if (treasury == address(0)) revert TreasuryIsZeroAddress();
         _mint(treasury, INITIAL_SUPPLY);
+    }
+
+    /**
+     * @notice BEP-20 compatibility. Returns the zero address, because this
+     *         token has no owner and never will.
+     *
+     * @dev Part of the BEP-20 interface as published by BNB Chain, and some
+     *      wallets, explorers and listing tools call it unconditionally. On a
+     *      contract that does not implement it the call reverts, and a tool
+     *      that does not expect that reports the token as malformed rather
+     *      than as ownerless. Returning `address(0)` is the honest answer and
+     *      is also the value those tools read as renounced.
+     *
+     *      It is a pure function returning a constant. It grants nothing, and
+     *      there is no setter.
+     */
+    function getOwner() external pure returns (address) {
+        return address(0);
     }
 }

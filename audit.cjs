@@ -1,4 +1,5 @@
 /* HCOW — adversarial and property tests. The checks an audit actually runs. */
+const { commitments } = require('./vestcommit.cjs');
 const fs = require('fs');
 const { VM } = require('@ethereumjs/vm');
 const { Common, Hardfork, Chain } = require('@ethereumjs/common');
@@ -31,19 +32,58 @@ async function call(to, data) {
   return bytesToHex(r.execResult.returnValue);
 }
 const read = (i, to, fn, a = []) => call(to, i.encodeFunctionData(fn, a)).then(r => i.decodeFunctionResult(fn, r)[0]);
+/**
+ * The custom error a reverted call returned, by name.
+ *
+ * Asserting only that something reverted is how a guard passes its own test
+ * for the wrong reason: two different guards on the same path both produce "it
+ * reverted", so deleting either one leaves the assertion green. Name the error.
+ */
+function errorName(iface, r) {
+  const data = bytesToHex(r.execResult.returnValue || new Uint8Array());
+  if (!data || data.length < 10) return '';
+  try { return iface.parseError(data)?.name ?? ''; } catch (_) { return ''; }
+}
 async function deploy(name, iface, args) {
   const r = await send({ data: load(name).bytecode + (args.length ? iface.encodeDeploy(args).slice(2) : '') });
   if (r.execResult.exceptionError) throw new Error(name + ' deploy: ' + r.execResult.exceptionError.error);
   return r.createdAddress;
 }
 
-/** Seal with the commitment the contract has actually been loaded with. */
-async function sealNow(vestAbi, v) {
-  const n = await read(vestAbi, v, 'beneficiaryCount');
-  const t = await read(vestAbi, v, 'totalScheduled');
-  const g = await read(vestAbi, v, 'totalTgeUnlock');
-  const h = await read(vestAbi, v, 'scheduleHash');
-  return send({ to: v, data: vestAbi.encodeFunctionData('seal', [n, t, g, h]) });
+/** Seal a contract that is already funded. */
+const sealNow = (vestAbi, v, from = 0) =>
+  send({ from, to: v, data: vestAbi.encodeFunctionData('seal') });
+
+/**
+ * Deploys HCOWVesting with the four commitments derived from `rows`, then loads
+ * those rows. The commitments are constructor arguments now, so a test can no
+ * longer read them back off the contract it has just loaded: that read-back was
+ * the audit's Low #1 and the whole reason they moved.
+ *
+ * rows: [[beneficiary, total, tgeBps, cliffMonths, linearMonths], ...]
+ * opts.count/total/unlock/hash override a single commitment, to deploy against
+ * a figure that deliberately disagrees with the table.
+ */
+async function deployVest(vestAbi, tokenAddr, tge, ownerAddr, rows, opts = {}) {
+  const c = commitments(rows.map(([b, total, bps, cliff, lin]) => ({
+    beneficiary: b, total, tgeBps: bps, cliffMonths: cliff, linearMonths: lin,
+  })));
+  const from = opts.from ?? 0;
+  const args = [tokenAddr, tge, ownerAddr, opts.rescue ?? acc[0].toString(),
+                opts.count ?? c.count, opts.total ?? c.total,
+                opts.unlock ?? c.unlock, opts.hash ?? c.hash];
+  if (opts.expectDeployRevert) {
+    const r = await send({ from, data: load('HCOWVesting').bytecode + vestAbi.encodeDeploy(args).slice(2) });
+    return { reverted: !!r.execResult.exceptionError, commit: c, args };
+  }
+  const v = await deploy('HCOWVesting', vestAbi, args);
+  if (!opts.skipLoad) {
+    for (const [b, total, bps, cliff, lin] of rows) {
+      const r = await send({ from, to: v, data: vestAbi.encodeFunctionData('addSchedule', [b, total, bps, cliff, lin]) });
+      if (r.execResult.exceptionError) throw new Error('deployVest: addSchedule reverted');
+    }
+  }
+  return { v, commit: c, args };
 }
 
 async function main() {
@@ -66,7 +106,11 @@ async function main() {
     // whose supply appears afterwards leaves the bound at zero. HCOWToken mints
     // its whole supply in its own constructor, so this ordering is the real one.
     await send({ to: rt, data: reAbi.encodeFunctionData('mint', [acc[0].toString(), 10_000n * E18]) });
-    const v = await deploy('HCOWVesting', vestAbi, [rt.toString(), tge, acc[0].toString()]);
+    const A_ROWS = [
+      [acc[1].toString(), 1_000n * E18, 5000, 0, 12],
+      [acc[2].toString(), 9_000n * E18, 5000, 0, 12],
+    ];
+    const { v } = await deployVest(vestAbi, rt.toString(), tge, acc[0].toString(), A_ROWS, { skipLoad: true });
     // Fund well above one schedule's total, and add a second schedule, so a
     // successful re-entrant payout would actually be fundable. Minting exactly
     // one schedule's worth makes the mock's own balance check do the work, and
@@ -74,8 +118,9 @@ async function main() {
     // all: an interaction-first release() double-pays here and the assertion
     // below still reads clean.
     await send({ to: rt, data: reAbi.encodeFunctionData('mint', [v.toString(), 10_000n * E18]) });
-    await send({ to: v, data: vestAbi.encodeFunctionData('addSchedule', [acc[1].toString(), 1_000n * E18, 5000, 0, 12]) });
-    await send({ to: v, data: vestAbi.encodeFunctionData('addSchedule', [acc[2].toString(), 9_000n * E18, 5000, 0, 12]) });
+    for (const [b, total, bps, cliff, lin] of A_ROWS) {
+      await send({ to: v, data: vestAbi.encodeFunctionData('addSchedule', [b, total, bps, cliff, lin]) });
+    }
     await sealNow(vestAbi, v);
     await send({ to: rt, data: reAbi.encodeFunctionData('arm', [v.toString(), acc[1].toString()]) });
     now = tge + 6n * MONTH;
@@ -96,7 +141,8 @@ async function main() {
     const sf = await deploy('SilentFailToken', sfAbi, []);
     const tge = now + 1n;
     await send({ to: sf, data: sfAbi.encodeFunctionData('mint', [acc[0].toString(), 100n * E18]) });
-    const v = await deploy('HCOWVesting', vestAbi, [sf.toString(), tge, acc[0].toString()]);
+    const { v } = await deployVest(vestAbi, sf.toString(), tge, acc[0].toString(),
+      [[acc[2].toString(), 100n * E18, 10000, 0, 0]], { skipLoad: true });
     await send({ to: sf, data: sfAbi.encodeFunctionData('mint', [v.toString(), 100n * E18]) });
     await send({ to: v, data: vestAbi.encodeFunctionData('addSchedule', [acc[2].toString(), 100n * E18, 10000, 0, 0]) });
     // Seal, or release() stops at the NotSealed gate and the assertion below
@@ -112,11 +158,13 @@ async function main() {
   {
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
-    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(),
+      [[acc[3].toString(), 1n * E18, 0, 0, 1]], { skipLoad: true, from: 1 });
     for (const [fn, args] of [
       ['addSchedule', [acc[3].toString(), 1n * E18, 0, 0, 1]],
       // seal is owner-only until TGE; `now` is ten days before it here.
-      ['seal', [1n, 1n, 0n, '0x' + '00'.repeat(32)]],
+      ['seal', []],
+      ['replaceTable', [[], [], [], [], []]],
     ]) {
       const r = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData(fn, args) });
       ok(!!r.execResult.exceptionError, `a stranger cannot call ${fn}()`);
@@ -135,8 +183,6 @@ async function main() {
   {
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
-    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
-
     // pseudo-random but deterministic parameter sweep
     const cases = [];
     let seed = 12345n;
@@ -150,11 +196,8 @@ async function main() {
         lin: Number(rnd(49n)),
       });
     }
-    for (const c of cases) {
-      const r = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
-        [c.who.toString(), c.total, c.bps, c.cliff, c.lin]) });
-      if (r.execResult.exceptionError) throw new Error('addSchedule failed: ' + JSON.stringify(c));
-    }
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(),
+      cases.map(c => [c.who.toString(), c.total, c.bps, c.cliff, c.lin]), { from: 1 });
 
     let monotonic = true, neverOver = true, tgeExact = true, endsExact = true, zeroBefore = true;
     const marks = [-1n, 0n, 1n, 3n, 6n, 12n, 18n, 24n, 36n, 48n, 72n, 120n];
@@ -187,11 +230,12 @@ async function main() {
   {
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
-    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
     const A = acc[2], B = acc[3], C = acc[5];
-    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule', [A.toString(), 100n * E18, 10000, 0, 0]) });
-    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule', [B.toString(), 100n * E18, 0, 6, 0]) });
-    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule', [C.toString(), 3n, 1, 0, 7]) });
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(), [
+      [A.toString(), 100n * E18, 10000, 0, 0],
+      [B.toString(), 100n * E18, 0, 6, 0],
+      [C.toString(), 3n, 1, 0, 7],
+    ], { from: 1 });
 
     now = tge;
     eq(await read(vestAbi, v, 'vestedAmount', [A.toString()]), 100n * E18, '100% TGE with no cliff releases everything immediately');
@@ -247,7 +291,8 @@ async function main() {
     //      be the figure that happens. A dropped fifth argument produces it.
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
-    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(),
+      [[acc[3].toString(), 100n * E18, 10000, 0, 0]], { skipLoad: true, from: 1 });
     const bad = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
       [acc[3].toString(), 60_000_000n * E18, 1500, 0, 0]) });
     ok(!!bad.execResult.exceptionError,
@@ -271,13 +316,16 @@ async function main() {
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
     const rows = [[20_000_000n, 2500, 0, 3], [10_000_000n, 0, 12, 36]];
+    // Both are deployed against the SAME commitment, the one the published
+    // table produces, because that is the situation the check exists for.
+    const honest = rows.map(([amt, bps, c, l], i) => [acc[2 + i].toString(), amt * E18, bps, c, l]);
     const load2 = async (swap) => {
-      const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
-      for (let i = 0; i < rows.length; i++) {
-        const [amt, bps, c, l] = rows[i];
-        await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
-          [acc[2 + i].toString(), amt * E18, bps, swap ? l : c, swap ? c : l]) });
-      }
+      const table = rows.map(([amt, bps, c, l], i) =>
+        [acc[2 + i].toString(), amt * E18, bps, swap ? l : c, swap ? c : l]);
+      const cm = commitments(honest.map(([b, total, bps, c, l]) =>
+        ({ beneficiary: b, total, tgeBps: bps, cliffMonths: c, linearMonths: l })));
+      const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(), table,
+        { from: 1, count: cm.count, total: cm.total, unlock: cm.unlock, hash: cm.hash });
       return v;
     };
     const good = await load2(false), swapped = await load2(true);
@@ -291,9 +339,7 @@ async function main() {
        'but the schedule hash differs, which is the only thing that catches it');
     await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer',
       [swapped.toString(), 30_000_000n * E18]) });
-    const r = await send({ from: 1, to: swapped, data: vestAbi.encodeFunctionData('seal',
-      [await read(vestAbi, good, 'beneficiaryCount'), await read(vestAbi, good, 'totalScheduled'),
-       await read(vestAbi, good, 'totalTgeUnlock'), await read(vestAbi, good, 'scheduleHash')]) });
+    const r = await send({ from: 1, to: swapped, data: vestAbi.encodeFunctionData('seal') });
     ok(!!r.execResult.exceptionError,
        'sealing a transposed load against the published commitment is refused');
   }
@@ -302,18 +348,16 @@ async function main() {
     //      no deadline; addSchedule is what closes at TGE.
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
-    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
     // A one month cliff so the assertion below is not chasing a second of linear.
-    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
-      [acc[3].toString(), 1_000n * E18, 2500, 1, 12]) });
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(),
+      [[acc[3].toString(), 1_000n * E18, 2500, 1, 12]], { from: 1 });
     await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 1_000n * E18]) });
     const saved = now;
     now = tge + 1n;
     const late = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
       [acc[4].toString(), 1n * E18, 10000, 0, 0]) });
     ok(!!late.execResult.exceptionError, 'a schedule cannot be added at or after TGE');
-    const sealLate = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('seal',
-      [1n, 1_000n * E18, 250n * E18, await read(vestAbi, v, 'scheduleHash')]) });
+    const sealLate = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('seal') });
     ok(!sealLate.execResult.exceptionError, 'but the contract can still be sealed after TGE');
     ok(await read(vestAbi, v, 'sealed_'), 'so a missed date is a delay, not a permanent loss');
     const rel = await send({ from: 0, to: v, data: vestAbi.encodeFunctionData('release', [acc[3].toString()]) });
@@ -327,7 +371,8 @@ async function main() {
     //      holder cannot block the published table from being loaded.
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
-    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(),
+      [[acc[3].toString(), 200_000_000n * E18, 0, 0, 12]], { skipLoad: true, from: 1 });
     await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [acc[5].toString(), 1n]) });
     await send({ from: 5, to: t, data: tokenAbi.encodeFunctionData('burn', [1n]) });
     ok(await read(tokenAbi, t, 'totalSupply') < 200_000_000n * E18, 'a holder burned one wei');
@@ -343,13 +388,11 @@ async function main() {
     //      was started before it.
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
-    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
-    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
-      [acc[3].toString(), 1_000n * E18, 2500, 0, 12]) });
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(),
+      [[acc[3].toString(), 1_000n * E18, 2500, 0, 12]], { from: 1 });
     await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 1_000n * E18]) });
     await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('transferOwnership', [acc[4].toString()]) });
-    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('seal',
-      [1n, 1_000n * E18, 250n * E18, await read(vestAbi, v, 'scheduleHash')]) });
+    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('seal') });
     const acc4 = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('acceptOwnership', []) });
     ok(!!acc4.execResult.exceptionError, 'a transfer pending at the seal cannot be accepted afterwards');
     eq((await read(vestAbi, v, 'owner')).toLowerCase(), acc[1].toString().toLowerCase(),
@@ -360,9 +403,9 @@ async function main() {
   {
     // G-7  A TGE further out than a year is a typo, not a plan.
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
-    const r = await send({ to: null, data: load('HCOWVesting').bytecode +
-      vestAbi.encodeDeploy([t.toString(), now + 400n * DAY, acc[1].toString()]).slice(2) });
-    ok(!!r.execResult.exceptionError, 'a TGE more than a year out is refused at construction');
+    const far = await deployVest(vestAbi, t.toString(), now + 400n * DAY, acc[1].toString(),
+      [[acc[3].toString(), 1n * E18, 0, 0, 12]], { expectDeployRevert: true });
+    ok(far.reverted, 'a TGE more than a year out is refused at construction');
   }
 
   {
@@ -372,23 +415,31 @@ async function main() {
     //      deadline used to cause, arriving by a different road.
     const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
     const tge = now + 10n * DAY;
-    const v = await deploy('HCOWVesting', vestAbi, [t.toString(), tge, acc[1].toString()]);
-    await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('addSchedule',
-      [acc[3].toString(), 1_000n * E18, 2500, 1, 12]) });
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(),
+      [[acc[3].toString(), 1_000n * E18, 2500, 1, 12]], { from: 1 });
     await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 1_000n * E18]) });
-    const commit = [1n, 1_000n * E18, 250n * E18, await read(vestAbi, v, 'scheduleHash')];
 
-    const early = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('seal', commit) });
+    const early = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('seal') });
     ok(!!early.execResult.exceptionError, 'before TGE only the owner can seal');
 
     const saved = now;
     now = tge + 1n;
-    const late = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('seal', commit) });
+    const late = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('seal') });
     ok(!late.execResult.exceptionError, 'at or after TGE anyone can seal');
     ok(await read(vestAbi, v, 'sealed_'), 'so a lost owner key is not a total loss');
-    const wrong = await send({ from: 4, to: v, data: vestAbi.encodeFunctionData('seal',
-      [2n, 1_000n * E18, 250n * E18, commit[3]]) });
-    ok(!!wrong.execResult.exceptionError, 'and a stranger still cannot seal against wrong figures');
+
+    // and a stranger still cannot seal a table that does not reach the figures
+    // fixed at deployment, because those figures are no longer theirs to supply
+    const t2 = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const { v: v2 } = await deployVest(vestAbi, t2.toString(), now + 10n * DAY, acc[1].toString(),
+      [[acc[3].toString(), 1_000n * E18, 2500, 1, 12],
+       [acc[4].toString(), 1_000n * E18, 2500, 1, 12]], { from: 1, skipLoad: true });
+    await send({ from: 1, to: v2, data: vestAbi.encodeFunctionData('addSchedule',
+      [acc[3].toString(), 1_000n * E18, 2500, 1, 12]) });
+    await send({ from: 1, to: t2, data: tokenAbi.encodeFunctionData('transfer', [v2.toString(), 2_000n * E18]) });
+    now = now + 11n * DAY;
+    const wrong = await send({ from: 4, to: v2, data: vestAbi.encodeFunctionData('seal') });
+    ok(!!wrong.execResult.exceptionError, 'and a stranger still cannot seal a half loaded table');
     now = saved;
   }
   {
@@ -396,9 +447,67 @@ async function main() {
     //      refuses every addSchedule and leaves a contract that can never be
     //      finished, added to, or renounced.
     const rt = await deploy('ReentrantToken', reAbi, []);
-    const r = await send({ to: null, data: load('HCOWVesting').bytecode +
-      vestAbi.encodeDeploy([rt.toString(), now + 10n * DAY, acc[1].toString()]).slice(2) });
-    ok(!!r.execResult.exceptionError, 'deploying against a token with zero supply is refused');
+    const zero = await deployVest(vestAbi, rt.toString(), now + 10n * DAY, acc[1].toString(),
+      [[acc[3].toString(), 1n * E18, 0, 0, 12]], { expectDeployRevert: true });
+    ok(zero.reverted, 'deploying against a token with zero supply is refused');
+  }
+  {
+    // G-10  The audit's Medium #1. A treasury short of the committed total that
+    //       sends the balance it holds rather than the figure asked for used to
+    //       strand everything: the transfer succeeded, seal could never pass,
+    //       release is gated on seal and there is no sweep. fundAndSeal removes
+    //       the figure a human has to type, so there is no wrong one to type.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const tge = now + 10n * DAY;
+    const ROWS = [[acc[3].toString(), 200_000_000n * E18, 2500, 0, 12]];
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(), ROWS, { from: 1 });
+
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('burn', [1n]) });
+    ok(!(await read(vestAbi, v, 'committedTotalIsFundable')),
+       'committedTotalIsFundable reports false once live supply falls below the commitment');
+    const held = await read(tokenAbi, t, 'balanceOf', [acc[1].toString()]);
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), held]) });
+    const stuck = await send({ from: 1, to: v, data: vestAbi.encodeFunctionData('seal') });
+    ok(!!stuck.execResult.exceptionError,
+       'a send-max transfer that falls short leaves a contract that can never be sealed');
+    // And it says why. Two guards stand on this path, the live-supply bound and
+    // the funding bound, so "it reverted" is satisfied by either and proves
+    // neither. The live-supply bound is the one that is meant to fire first,
+    // because it names the condition that can never be fixed by sending more.
+    eq(errorName(vestAbi, stuck), 'CommittedTotalExceedsLiveSupply',
+       'and it names the committed total against live supply, not merely underfunding');
+
+    // the same table on an intact supply, funded and sealed atomically
+    const t2 = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const { v: v2 } = await deployVest(vestAbi, t2.toString(), tge, acc[1].toString(), ROWS, { from: 1 });
+    await send({ from: 1, to: t2, data: tokenAbi.encodeFunctionData('approve', [v2.toString(), 200_000_000n * E18]) });
+    const atomic = await send({ from: 1, to: v2, data: vestAbi.encodeFunctionData('fundAndSeal') });
+    ok(!atomic.execResult.exceptionError, 'fundAndSeal funds and seals in a single transaction');
+    ok(await read(vestAbi, v2, 'sealed_'), 'leaving no funded-and-unsealed window for the owner key to act in');
+    eq(await read(tokenAbi, t2, 'balanceOf', [v2.toString()]), 200_000_000n * E18,
+       'and it pulled exactly the committed total');
+  }
+  {
+    // G-11  A foreign token sent here by mistake can be recovered. The vesting
+    //       token itself never can, which is the property being protected.
+    const t = await deploy('HCOWToken', tokenAbi, [acc[1].toString()]);
+    const other = await deploy('HCOWToken', tokenAbi, [acc[2].toString()]);
+    const tge = now + 10n * DAY;
+    const { v } = await deployVest(vestAbi, t.toString(), tge, acc[1].toString(),
+      [[acc[3].toString(), 1_000n * E18, 2500, 0, 12]], { from: 1, rescue: acc[4].toString() });
+    await send({ from: 2, to: other, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 500n * E18]) });
+    // The vesting token has to actually be in there, or the refusal comes from
+    // NothingToRescue and the guard under test is never reached: the assertion
+    // then passes with the guard deleted, which is the same as not having it.
+    await send({ from: 1, to: t, data: tokenAbi.encodeFunctionData('transfer', [v.toString(), 1_000n * E18]) });
+    const bad = await send({ from: 2, to: v, data: vestAbi.encodeFunctionData('rescueForeignToken', [t.toString()]) });
+    ok(!!bad.execResult.exceptionError, 'the vesting token itself can never be rescued');
+    eq(errorName(vestAbi, bad), 'CannotRescueVestingToken',
+       'and it is refused for being the vesting token, not for the balance being empty');
+    const good = await send({ from: 2, to: v, data: vestAbi.encodeFunctionData('rescueForeignToken', [other.toString()]) });
+    ok(!good.execResult.exceptionError, 'but a foreign token can be, by anyone');
+    eq(await read(tokenAbi, other, 'balanceOf', [acc[4].toString()]), 500n * E18,
+       'and it goes to the address fixed at deployment, not to whoever called');
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

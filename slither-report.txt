@@ -3,13 +3,28 @@
 'forge build --build-info --deny never contracts' running (wd: /home/claude/vest)
 INFO:Detectors:
 Detector: incorrect-equality
-HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#362-380) uses a dangerous strict equality:
-	- remainder == 0 (contracts/HCOWVesting.sol#368)
-HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#362-380) uses a dangerous strict equality:
-	- duration == 0 (contracts/HCOWVesting.sol#374)
-HCOWVesting.release(address) (contracts/HCOWVesting.sol#303-325) uses a dangerous strict equality:
-	- amount == 0 (contracts/HCOWVesting.sol#314)
+HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#614-632) uses a dangerous strict equality:
+	- remainder == 0 (contracts/HCOWVesting.sol#620)
+HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#614-632) uses a dangerous strict equality:
+	- duration == 0 (contracts/HCOWVesting.sol#626)
+HCOWVesting.release(address) (contracts/HCOWVesting.sol#549-571) uses a dangerous strict equality:
+	- amount == 0 (contracts/HCOWVesting.sol#560)
+HCOWVesting.rescueForeignToken(address) (contracts/HCOWVesting.sol#693-699) uses a dangerous strict equality:
+	- amount == 0 (contracts/HCOWVesting.sol#696)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#dangerous-strict-equalities
+INFO:Detectors:
+Detector: reentrancy-no-eth
+Reentrancy in HCOWVesting.fundAndSeal() (contracts/HCOWVesting.sol#481-489):
+	External calls:
+	- token.safeTransferFrom(msg.sender,address(this),owed - held) (contracts/HCOWVesting.sol#486)
+	State variables written after the call(s):
+	- _seal() (contracts/HCOWVesting.sol#488)
+		- _owner = newOwner (node_modules/@openzeppelin/contracts/access/Ownable.sol#97)
+	Ownable._owner (node_modules/@openzeppelin/contracts/access/Ownable.sol#21) can be used in cross function reentrancies:
+	- Ownable._transferOwnership(address) (node_modules/@openzeppelin/contracts/access/Ownable.sol#95-99)
+	- Ownable.owner() (node_modules/@openzeppelin/contracts/access/Ownable.sol#56-58)
+	- Ownable.owner() (node_modules/@openzeppelin/contracts/access/Ownable.sol#56-58)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#reentrancy-vulnerabilities-2
 INFO:Detectors:
 Detector: missing-zero-check
 ReentrantToken.arm(address,address).vesting_ (contracts/test/Attackers.sol#23) lacks a zero-check on :
@@ -19,6 +34,14 @@ ReentrantToken.arm(address,address).target_ (contracts/test/Attackers.sol#23) la
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#missing-zero-address-validation
 INFO:Detectors:
 Detector: reentrancy-benign
+Reentrancy in HCOWVesting.fundAndSeal() (contracts/HCOWVesting.sol#481-489):
+	External calls:
+	- token.safeTransferFrom(msg.sender,address(this),owed - held) (contracts/HCOWVesting.sol#486)
+	State variables written after the call(s):
+	- _seal() (contracts/HCOWVesting.sol#488)
+		- delete _pendingOwner (node_modules/@openzeppelin/contracts/access/Ownable2Step.sol#45)
+	- _seal() (contracts/HCOWVesting.sol#488)
+		- sealed_ = true (contracts/HCOWVesting.sol#538)
 Reentrancy in ReentrantToken.transfer(address,uint256) (contracts/test/Attackers.sol#25-37):
 	External calls:
 	- IVesting(vesting).release(target) (contracts/test/Attackers.sol#33-34)
@@ -27,39 +50,56 @@ Reentrancy in ReentrantToken.transfer(address,uint256) (contracts/test/Attackers
 	- reentrySucceeded = false (contracts/test/Attackers.sol#34)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#reentrancy-vulnerabilities-3
 INFO:Detectors:
+Detector: reentrancy-events
+Reentrancy in HCOWVesting.fundAndSeal() (contracts/HCOWVesting.sol#481-489):
+	External calls:
+	- token.safeTransferFrom(msg.sender,address(this),owed - held) (contracts/HCOWVesting.sol#486)
+	Event emitted after the call(s):
+	- OwnershipTransferred(oldOwner,newOwner) (node_modules/@openzeppelin/contracts/access/Ownable.sol#98)
+		- _seal() (contracts/HCOWVesting.sol#488)
+	- Sealed(_beneficiaries.length,totalScheduled) (contracts/HCOWVesting.sol#543)
+		- _seal() (contracts/HCOWVesting.sol#488)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#reentrancy-vulnerabilities-4
+INFO:Detectors:
 Detector: timestamp
-HCOWVesting.constructor(address,uint256,address) (contracts/HCOWVesting.sol#135-150) uses timestamp for comparisons
+HCOWVesting.constructor(address,uint256,address,address,uint256,uint256,uint256,bytes32) (contracts/HCOWVesting.sol#197-259) uses timestamp for comparisons
 	Dangerous comparisons:
-	- tgeTime_ <= block.timestamp (contracts/HCOWVesting.sol#137)
-	- tgeTime_ > block.timestamp + MAX_TGE_HORIZON (contracts/HCOWVesting.sol#138)
-HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#154-204) uses timestamp for comparisons
+	- tgeTime_ <= block.timestamp (contracts/HCOWVesting.sol#219)
+	- tgeTime_ > block.timestamp + MAX_TGE_HORIZON (contracts/HCOWVesting.sol#220)
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#263-317) uses timestamp for comparisons
 	Dangerous comparisons:
-	- block.timestamp >= tgeTime (contracts/HCOWVesting.sol#167)
-HCOWVesting.seal(uint256,uint256,uint256,bytes32) (contracts/HCOWVesting.sol#257-298) uses timestamp for comparisons
+	- block.timestamp >= tgeTime (contracts/HCOWVesting.sol#276)
+HCOWVesting.replaceTable(address[],uint128[],uint16[],uint16[],uint16[]) (contracts/HCOWVesting.sol#369-401) uses timestamp for comparisons
 	Dangerous comparisons:
-	- block.timestamp < tgeTime && msg.sender != owner() (contracts/HCOWVesting.sol#271)
-	- _beneficiaries.length != expectedBeneficiaries || totalScheduled != expectedScheduled || totalTgeUnlock() != expectedTgeUnlock || scheduleHash != expectedScheduleHash (contracts/HCOWVesting.sol#282-285)
-HCOWVesting.release(address) (contracts/HCOWVesting.sol#303-325) uses timestamp for comparisons
+	- block.timestamp >= tgeTime (contracts/HCOWVesting.sol#377)
+HCOWVesting._authoriseSeal() (contracts/HCOWVesting.sol#491-503) uses timestamp for comparisons
 	Dangerous comparisons:
-	- amount == 0 (contracts/HCOWVesting.sol#314)
-HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#362-380) uses timestamp for comparisons
+	- block.timestamp < tgeTime && msg.sender != owner() (contracts/HCOWVesting.sol#500)
+HCOWVesting._seal() (contracts/HCOWVesting.sol#505-544) uses timestamp for comparisons
 	Dangerous comparisons:
-	- ts < tgeTime (contracts/HCOWVesting.sol#364)
-	- remainder == 0 (contracts/HCOWVesting.sol#368)
-	- ts < cliffEnd (contracts/HCOWVesting.sol#371)
-	- duration == 0 (contracts/HCOWVesting.sol#374)
-	- elapsed >= duration (contracts/HCOWVesting.sol#377)
-HCOWVesting.fundingShortfall() (contracts/HCOWVesting.sol#387-391) uses timestamp for comparisons
+	- _beneficiaries.length != expectedBeneficiaries || totalScheduled != expectedScheduled || tgeUnlock != expectedTgeUnlock || scheduleHash != expectedScheduleHash (contracts/HCOWVesting.sol#516-519)
+	- held < owed (contracts/HCOWVesting.sol#536)
+HCOWVesting.release(address) (contracts/HCOWVesting.sol#549-571) uses timestamp for comparisons
 	Dangerous comparisons:
-	- held >= owed (contracts/HCOWVesting.sol#390)
+	- amount == 0 (contracts/HCOWVesting.sol#560)
+HCOWVesting._vestedAt(HCOWVesting.Schedule,uint256) (contracts/HCOWVesting.sol#614-632) uses timestamp for comparisons
+	Dangerous comparisons:
+	- ts < tgeTime (contracts/HCOWVesting.sol#616)
+	- remainder == 0 (contracts/HCOWVesting.sol#620)
+	- ts < cliffEnd (contracts/HCOWVesting.sol#623)
+	- duration == 0 (contracts/HCOWVesting.sol#626)
+	- elapsed >= duration (contracts/HCOWVesting.sol#629)
+HCOWVesting.fundingShortfall() (contracts/HCOWVesting.sol#639-643) uses timestamp for comparisons
+	Dangerous comparisons:
+	- held >= owed (contracts/HCOWVesting.sol#642)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#block-timestamp
 INFO:Detectors:
 Detector: pragma
 2 different versions of Solidity are used:
-	- Version constraint 0.8.24 is used by:
-		-0.8.24 (contracts/HCOWToken.sol#2)
-		-0.8.24 (contracts/HCOWVesting.sol#2)
-		-0.8.24 (contracts/test/Attackers.sol#2)
+	- Version constraint 0.8.34 is used by:
+		-0.8.34 (contracts/HCOWToken.sol#2)
+		-0.8.34 (contracts/HCOWVesting.sol#2)
+		-0.8.34 (contracts/test/Attackers.sol#2)
 	- Version constraint ^0.8.20 is used by:
 		-^0.8.20 (node_modules/@openzeppelin/contracts/access/Ownable.sol#4)
 		-^0.8.20 (node_modules/@openzeppelin/contracts/access/Ownable2Step.sol#4)
@@ -86,17 +126,31 @@ Detector: pragma
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#different-pragma-directives-are-used
 INFO:Detectors:
 Detector: costly-loop
-HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#154-204) has costly operations inside a loop:
-	- totalScheduled += total (contracts/HCOWVesting.sol#195)
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#263-317) has costly operations inside a loop:
+	- totalScheduled += total (contracts/HCOWVesting.sol#308)
 	Calls stack containing the loop:
 		HCOWVesting.addSchedules(address[],uint128[],uint16[],uint16[],uint16[])
-HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#154-204) has costly operations inside a loop:
-	- scheduleHash = keccak256(bytes)(abi.encodePacked(scheduleHash,beneficiary,total,tgeBps,cliffMonths,linearMonths)) (contracts/HCOWVesting.sol#199-201)
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#263-317) has costly operations inside a loop:
+	- scheduleHash = keccak256(bytes)(abi.encodePacked(scheduleHash,beneficiary,total,tgeBps,cliffMonths,linearMonths)) (contracts/HCOWVesting.sol#312-314)
 	Calls stack containing the loop:
 		HCOWVesting.addSchedules(address[],uint128[],uint16[],uint16[],uint16[])
+HCOWVesting.replaceTable(address[],uint128[],uint16[],uint16[],uint16[]) (contracts/HCOWVesting.sol#369-401) has costly operations inside a loop:
+	- delete schedules[_beneficiaries[i]] (contracts/HCOWVesting.sol#391)
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#263-317) has costly operations inside a loop:
+	- totalScheduled += total (contracts/HCOWVesting.sol#308)
+	Calls stack containing the loop:
+		HCOWVesting.replaceTable(address[],uint128[],uint16[],uint16[],uint16[])
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#263-317) has costly operations inside a loop:
+	- scheduleHash = keccak256(bytes)(abi.encodePacked(scheduleHash,beneficiary,total,tgeBps,cliffMonths,linearMonths)) (contracts/HCOWVesting.sol#312-314)
+	Calls stack containing the loop:
+		HCOWVesting.replaceTable(address[],uint128[],uint16[],uint16[],uint16[])
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#costly-operations-inside-a-loop
 INFO:Detectors:
+Detector: cyclomatic-complexity
+HCOWVesting.addSchedule(address,uint128,uint16,uint16,uint16) (contracts/HCOWVesting.sol#263-317) has a high cyclomatic complexity (12).
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#cyclomatic-complexity
+INFO:Detectors:
 Detector: missing-inheritance
-HCOWVesting (contracts/HCOWVesting.sol#50-416) should inherit from IVesting (contracts/test/Attackers.sol#6-9)
+HCOWVesting (contracts/HCOWVesting.sol#57-700) should inherit from IVesting (contracts/test/Attackers.sol#6-9)
 Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#missing-inheritance
-INFO:Slither:contracts/ analyzed (30 contracts with 102 detectors), 16 result(s) found
+INFO:Slither:contracts/ analyzed (29 contracts with 102 detectors), 26 result(s) found

@@ -1,16 +1,25 @@
 # HCOW Contracts — HCOWToken and HCOWVesting
 
-Reference implementations written by HashCow. Solidity 0.8.24, OpenZeppelin 5.0.2.
-Both compile clean with zero warnings and pass 110 assertions.
+Reference implementations written by HashCow. Solidity 0.8.34, OpenZeppelin 5.0.2.
+Both compile clean with zero warnings and pass 161 assertions, plus 20 Foundry tests including 13 invariant properties. Measured 29 August 2026.
 
 ```
 npm test           # compiles, runs both suites below, then forge test
-node compile.cjs   # solc 0.8.24, optimizer on, 200 runs
-node test.cjs      # functional suite, 54 assertions, in-process EVM
-node audit.cjs     # adversarial and property suite, 56 assertions
-forge test         # 13 machine-searched invariants + 3 tests, 32,768 calls each
+node compile.cjs   # solc 0.8.34 pinned, optimizer on, 200 runs, evmVersion paris
+node test.cjs      # functional suite, 94 assertions, in-process EVM
+node audit.cjs     # adversarial and property suite, 67 assertions
+forge test         # 14 machine-searched invariants + 6 tests, 32,768 calls each
 npm run test:fuzz:deep   # the same, 2000 runs x 400 calls
+npm run test:mutate      # deletes each guard in turn and checks the suite notices
 ```
+
+**The compiler is pinned, and pinned to the same version `hcow-protocol` uses.**
+Both repositories are audited and deployed together, and a compiler difference
+between them is a difference nobody would think to look for. `evmVersion` is set
+to `paris` explicitly rather than defaulted: a newer default target emits
+opcodes BNB Chain may not have, and the failure mode is a contract that deploys
+and then reverts on a path nobody exercised on a local chain that did have
+them.
 
 `forge test` needs the Foundry standard library once, because it is not
 committed:
@@ -26,7 +35,15 @@ counterexamples, in both phases: the sealed contract, and the loading phase
 where an irreversible mistake about 200,000,000 tokens gets made.
 
 Before trusting any property, delete the guard it claims to protect and check
-that it fails. That is how the gaps in this suite were found.
+that it fails. That is how the gaps in this suite were found, and it is now
+`npm run test:mutate` rather than an instruction: the runner applies each
+mutation, runs the suite that should catch it, restores the file, and refuses
+to call a mutation caught unless the suite failed **on the assertion that names
+it**. Two assertions in this repository were found to be passing for the wrong
+reason that way. One checked that the vesting token could not be rescued, but
+the contract held none of it, so the refusal came from `NothingToRescue` and
+the assertion passed with the guard deleted. Both now assert the error by
+name.
 
 `npm test` compiles first, deliberately. `test.cjs` and `audit.cjs` read
 prebuilt artifacts from disk, so running them without compiling tests whatever
@@ -43,20 +60,32 @@ look like findings are a missing zero-check inside the test doubles, a
 sealing a full two-hundred-schedule table costs 458,729 gas.
 
 ```
-slither contracts/ --solc /usr/local/bin/solc-0.8.24 \
+slither contracts/ --solc /usr/local/bin/solc \
   --solc-remaps "@openzeppelin/=node_modules/@openzeppelin/" --exclude-dependencies
 ```
 
-Deployed sizes: HCOWToken 3,972 bytes, HCOWVesting 6,535 bytes. Limit is 24,576.
+Deployed sizes: HCOWToken 4,083 bytes, HCOWVesting 8,636 bytes. Limit is 24,576.
 
 These two contracts were reviewed for the first time on 25 August 2026, as part
 of a system-level pass across both repositories. That review found one Critical
 and three High findings here, all of them now fixed and all of them regression
 tested in `audit.cjs` section G. Section 14 of `SECURITY.md` in the
-`hcow-protocol` repository is the full write-up. **They must be inside the
-external audit scope**: about 220 lines of Solidity, excluding comments and
-blanks, that control 100% of the supply. Whatever a firm's line counting
-convention turns out to be, it is the cheapest 220 lines anyone will ever buy.
+`hcow-protocol` repository is the full write-up.
+
+**They were then audited externally.** SolidProof's first report, 28 August
+2026, covered this repository at commit `4a3e373` and raised two Mediums here,
+both about the loading phase rather than the vesting arithmetic: a partial
+funding could strand the contract permanently, and a mistyped row could not be
+corrected before sealing. Both are fixed, by `fundAndSeal()` and
+`replaceTable()` respectively, and section 20 of `SECURITY.md` in
+`hcow-protocol` records every finding including the one that was declined.
+
+**The first fix for the second Medium was itself a High severity defect.** It
+was a bare `resetTable()`, and it created a permanent total-loss path this
+contract did not have: measured, one call stranded 3,000,000 HCOW. Every suite
+was green when it was written. Section 21 of that `SECURITY.md` is the write-up.
+**The fixes are after the audited commit and have not themselves been reviewed
+externally.**
 
 ---
 
@@ -130,12 +159,53 @@ so the figure `seal()` commits to is the figure that actually releases.
 **Release is permissionless.** Anyone may call `release(beneficiary)`. Tokens
 always go to the beneficiary, never to the caller.
 
-**Funding is separate from scheduling.** Adding a schedule does not move
-tokens. `totalScheduled()` tells you how much the contract needs and
-`fundingShortfall()` tells you how much is still missing.
+**Funding and sealing happen in ONE transaction.** `fundAndSeal()` pulls
+exactly `totalScheduled - totalReleased`, or nothing if the contract is already
+funded, and seals in the same call. It exists because the audit found that
+funding and sealing as two steps left a window, and because a treasury that
+sent the balance it held rather than the figure it was asked for stranded the
+contract permanently: the transfer succeeded, `seal()` could never pass, and
+there is no sweep. There is now no figure for a human to type, so there is no
+wrong one to type. Anyone may call it; the tokens come from the caller.
+
+`totalScheduled()` still tells you how much the contract needs,
+`fundingShortfall()` how much is missing, and `committedTotalIsFundable()`
+whether live supply is even large enough, which is checked again at seal and
+reported by its own error rather than as underfunding.
+
+**A mistyped row can be corrected before sealing.** `replaceTable()` swaps the
+whole table, before the seal and before TGE. Before it existed, one wrong digit
+meant deploying again from scratch. It cannot run after either boundary.
+
+It clears and reloads in ONE call, deliberately. The first attempt at this was a
+bare `resetTable()` that only cleared, and it created a permanent total-loss
+path the contract did not have: clear a funded table, fail to rebuild it before
+TGE, and `addSchedule` is closed, `seal()` reverts `NoSchedules` forever,
+`release()` is gated on the seal, and there is no sweep. Measured on that
+version, one call stranded 3,000,000 HCOW.
+
+Its own comment claimed it granted the owner no power it did not already have,
+and that was wrong in a way worth naming: declining to seal is **recoverable**,
+which is why `seal()` has no deadline and becomes permissionless at TGE.
+Emptying a funded table is not. Guarding it on the contract being empty was the
+obvious second fix and also wrong, because anyone can send one wei here before
+the table is loaded and disable the correction path for good. This form has
+neither problem: the empty table is not a reachable state, funded or not.
+
+**A schedule cannot run past ten years.** `cliffMonths + linearMonths` is
+bounded at `MAX_VESTING_MONTHS = 120`, checked on entry, because a mistyped
+period is otherwise permanent.
 
 **`totalTgeUnlock()`** sums the TGE unlock across every schedule. Call it
 before deploying and check it against the published TGE circulating supply.
+
+**A foreign token sent here by mistake can be recovered; HCOW never can.**
+`rescueForeignToken(other)` is callable by anyone and always sends to an
+address fixed at deployment. It refuses `address(token)`, and that refusal is
+the point: a sweep of the vesting token is a withdrawal path out of a contract
+whose entire promise is that it has none. The audit suggested including it and
+that half is declined, with the reason stated rather than the suggestion
+silently dropped.
 
 ---
 
@@ -180,7 +250,13 @@ before deploying and check it against the published TGE circulating supply.
 2. Deploy `HCOWToken(treasury = <treasury address>)`.
 3. Verify the source on BscScan and confirm the deployed bytecode matches
    what was audited. Do this before any value moves.
-4. Deploy `HCOWVesting(token, tgeTime, owner = <treasury address>)`.
+4. Deploy `HCOWVesting(token, tgeTime, owner, rescueRecipient,
+   expectedBeneficiaries, expectedScheduled, expectedTgeUnlock,
+   expectedScheduleHash)`. **The four commitments are computed from the signed
+   off table before deploying, not read back off a loaded contract.** Reading
+   them back makes the check a tautology, which is exactly the defect that put
+   them in the constructor. `vestcommit.cjs` computes all four; the formula is
+   in step 8 below and `total` is `uint128`.
    **`tgeTime` is not the listing time.** Set it deliberately. If the exchange
    listing is at T, setting `tgeTime` to T plus two hours means no beneficiary
    can release a single token during the first two hours of trading. Whatever
@@ -206,14 +282,15 @@ before deploying and check it against the published TGE circulating supply.
    > and is not scheduled, so the real figures are lower. Work out that exact
    > triple beforehand, have operations sign it, and hold the deployment to it.
    > Never accept "it is smaller, and that is expected" on the day.
-7. Transfer the scheduled total into the vesting contract. Transfer the exact
-   amount: excess is permanently locked, there is no sweep. Confirm both
-   `fundingShortfall()` is 0 and `token.balanceOf(vesting)` equals
-   `totalScheduled()`.
-8. Call `seal(expectedBeneficiaries, expectedScheduled, expectedTgeUnlock,
-   expectedScheduleHash)` with the figures from step 6. The contract refuses to
-   seal unless all four agree, so the sign off becomes an on chain assertion
-   rather than something read off a screen at four in the morning.
+7. Approve the vesting contract for the scheduled total from the treasury.
+8. Call **`fundAndSeal()`** from the treasury. It pulls exactly what is owed
+   and seals in the same transaction. Do not fund and seal as two calls: the
+   window between them is one where the owner key can write a schedule for
+   itself at a full TGE unlock, and ordering alone cannot close it.
+
+   The contract still checks all four commitments, which are now fixed in the
+   constructor from step 4, so the sign off is an on chain assertion rather
+   than something read off a screen at four in the morning.
 
    The fourth argument is a running hash over every schedule, field by field,
    in the order they were added. Read it from `scheduleHash()` after step 5 and
@@ -250,11 +327,11 @@ before deploying and check it against the published TGE circulating supply.
    the total and the TGE unlock are all still exactly right. This is the only
    value that moves.
 
-Funding comes before sealing and the contract enforces that. Sealing itself has
-no deadline: `addSchedule` is what closes at `tgeTime`, so a date that slips is
-a delay rather than the permanent loss of everything the contract holds. Seal
-before TGE anyway, for the reason in the next paragraph. Step 6 is the last
-chance to fix a mistake and step 8 removes the ability to make one.
+Sealing has no deadline: `addSchedule` is what closes at `tgeTime`, so a date
+that slips is a delay rather than the permanent loss of everything the contract
+holds. Seal before TGE anyway, for the reason in the next paragraph. Step 6 is
+the last chance to fix a mistake, `replaceTable()` is how a mistake found there
+is fixed, and step 8 removes the ability to make one.
 
 From `tgeTime` onward `seal()` is permissionless. The table is frozen by then
 and all four commitments have to match figures that are already public, so the
@@ -262,12 +339,14 @@ only thing another caller can do is finish a job that was left undone. That is
 deliberate: an owner key that is lost or frozen between funding and sealing
 would otherwise hold every beneficiary's tokens with no sweep and no recovery.
 
-**Do steps 7 and 8 in one signing session.** Between funding and sealing the
-owner key can write a schedule for itself at a full TGE unlock and take
-whatever the contract holds above what is already committed. Nothing releases
-before the seal, so the window is only dangerous while it is open: close it in
-the same batch. The same reason applies to doing it early rather than on the
-eve of TGE, and it matters most when the treasury is a single key.
+**Steps 7 and 8 are one transaction, not one signing session.** Between funding
+and sealing the owner key can write a schedule for itself at a full TGE unlock
+and take whatever the contract holds above what is already committed. "Do them
+close together" was the earlier rule and it was not enough: the audit's
+Informational #1 is that ordering cannot close a window, only atomicity can.
+`fundAndSeal()` is that atomicity. It matters most when the treasury is a
+single key, and it is also the reason to do this early rather than on the eve
+of TGE.
 
 ---
 
@@ -279,4 +358,5 @@ eve of TGE, and it matters most when the treasury is a single key.
 | Beneficiary addresses | The tests use placeholders. Real addresses needed before step 5 |
 | Treasury custody | Single key or multisig. If single key, use a hardware wallet and fund and seal the vesting contract early to limit exposure |
 | Beneficiary cap | `MAX_BENEFICIARIES` is 200. The published allocation uses nine |
-| Audit firm and scope | The audit must cover the exact source that gets deployed, not an earlier revision |
+| Rescue recipient | Constructor argument, fixed forever. Where a foreign token sent here by mistake goes. Not the deployer by default; decide it deliberately |
+| The re-audit | The first report is answered in full. The answers themselves have been reviewed by nobody outside this repository. The audit must ultimately cover the exact source that gets deployed, not an earlier revision |

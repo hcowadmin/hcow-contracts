@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity 0.8.34;
 
 import {Test} from "forge-std/Test.sol";
 import {HCOWVesting} from "../contracts/HCOWVesting.sol";
 import {HCOWToken} from "../contracts/HCOWToken.sol";
+import {Commit} from "./Commit.sol";
 
 /**
  * @title LoadHandler
@@ -25,11 +26,96 @@ contract LoadHandler is Test {
     uint256 public ghostAddedAtOrAfterTge;
     uint256 public ghostUnlockMismatch;   // totalTgeUnlock disagreed with what actually releases
     uint256 public ghostSealed;
+    uint256 public ghostSealedOffCommitment; // sealed while the table was not the committed one
+    uint256 public ghostResets;
     uint256 public nextBen = 0x4000;
 
-    constructor(HCOWVesting v_, HCOWToken t_, address owner_) { v = v_; t = t_; owner = owner_; }
+    /// The table the contract was deployed against. addTargetRow walks it in
+    /// order; addJunkRow adds anything else. Seal can only ever succeed on the
+    /// first, which is the point: the commitment is fixed before any row
+    /// exists, so a campaign that only ever produced junk would never seal and
+    /// every property downstream of sealing would pass having observed nothing.
+    address[] public tb;
+    uint128[] public tt;
+    uint16[] public tbps;
+    uint16[] public tclf;
+    uint16[] public tlin;
+    uint256 public targetCursor;
 
-    function addSchedule(uint256 amtSeed, uint256 bpsSeed, uint256 clfSeed, uint256 linSeed) external {
+    constructor(HCOWVesting v_, HCOWToken t_, address owner_) {
+        v = v_; t = t_; owner = owner_;
+        uint128[4] memory a = [uint128(60_000_000e18), 40_000_000e18, 20_000_000e18, 10_000_000e18];
+        uint16[4] memory b = [uint16(1500), 750, 2500, 0];
+        uint16[4] memory c = [uint16(0), 6, 0, 12];
+        uint16[4] memory d = [uint16(12), 12, 3, 36];
+        for (uint256 i = 0; i < 4; ++i) {
+            tb.push(address(uint160(0x9000 + i)));
+            tt.push(a[i]); tbps.push(b[i]); tclf.push(c[i]); tlin.push(d[i]);
+        }
+    }
+
+    function target() external view
+        returns (address[] memory, uint128[] memory, uint16[] memory, uint16[] memory, uint16[] memory)
+    { return (tb, tt, tbps, tclf, tlin); }
+
+    /// Walks the committed table in order, so the campaign can actually reach
+    /// a sealable state.
+    function addTargetRow() external {
+        uint256 i = targetCursor;
+        if (i >= tb.length) return;
+        bool wasSealed = v.sealed_();
+        bool atOrAfterTge = block.timestamp >= v.tgeTime();
+        vm.prank(owner);
+        try v.addSchedule(tb[i], tt[i], tbps[i], tclf[i], tlin[i]) {
+            targetCursor = i + 1;
+            if (wasSealed) ghostAddedAfterSeal += 1;
+            if (atOrAfterTge) ghostAddedAtOrAfterTge += 1;
+        } catch {}
+    }
+
+    /// The runbook path, in one action: clear whatever is loaded, load the
+    /// committed table in order, approve, and fund and seal atomically.
+    ///
+    /// Without an action that can actually reach a sealed contract, every
+    /// property that only looks at a sealed one passes having observed nothing,
+    /// which is the coverage failure the audit found in the ProfitShare suite.
+    function runbookLoadAndSeal() external {
+        vm.startPrank(owner);
+        try v.replaceTable(tb, tt, tbps, tclf, tlin) {
+            targetCursor = tb.length;
+            ghostResets += 1;
+        } catch {
+            for (uint256 i = 0; i < tb.length; ++i) {
+                try v.addSchedule(tb[i], tt[i], tbps[i], tclf[i], tlin[i]) {} catch {}
+            }
+        }
+        try t.approve(address(v), type(uint256).max) {} catch {}
+        bool onCommitment =
+            v.beneficiaryCount() == v.expectedBeneficiaries() &&
+            v.totalScheduled() == v.expectedScheduled() &&
+            v.scheduleHash() == v.expectedScheduleHash();
+        try v.fundAndSeal() {
+            ghostSealed += 1;
+            if (!onCommitment) ghostSealedOffCommitment += 1;
+        } catch {}
+        vm.stopPrank();
+    }
+
+    /// Swaps the whole table. The audit's Medium #2: without this a mistyped
+    /// row was unrecoverable and the contract had to be redeployed.
+    ///
+    /// It clears and reloads in one call deliberately. A bare clear created a
+    /// permanent total-loss path, so the empty table is not a state this
+    /// generator can reach either, which is the property being modelled.
+    function replaceTable() external {
+        vm.prank(owner);
+        try v.replaceTable(tb, tt, tbps, tclf, tlin) {
+            targetCursor = tb.length;
+            ghostResets += 1;
+        } catch {}
+    }
+
+    function addJunkRow(uint256 amtSeed, uint256 bpsSeed, uint256 clfSeed, uint256 linSeed) external {
         bool wasSealed = v.sealed_();
         bool atOrAfterTge = block.timestamp >= v.tgeTime();
         address b = address(uint160(nextBen++));
@@ -56,11 +142,18 @@ contract LoadHandler is Test {
         t.transfer(address(v), amt);
     }
 
-    function seal(uint256 nSeed) external {
-        uint256 n = nSeed % 4 == 0 ? bound(nSeed, 0, 50) : v.beneficiaryCount();
-        vm.prank(owner);
-        try v.seal(n, v.totalScheduled(), v.totalTgeUnlock(), v.scheduleHash()) {
+    function seal(uint256 seed) external {
+        // half the attempts go through fundAndSeal, which is the intended path
+        bool onCommitment =
+            v.beneficiaryCount() == v.expectedBeneficiaries() &&
+            v.totalScheduled() == v.expectedScheduled() &&
+            v.scheduleHash() == v.expectedScheduleHash();
+        bool atomic = seed % 2 == 0;
+        vm.startPrank(owner);
+        if (atomic) { try t.approve(address(v), type(uint256).max) {} catch {} }
+        try this.callSeal(atomic) {
             ghostSealed += 1;
+            if (!onCommitment) ghostSealedOffCommitment += 1;
             // The commitment must be what actually happens. Warp to TGE on a
             // fork of the state and compare; if the two disagree the figure
             // signed off is not the figure that unlocks.
@@ -74,6 +167,13 @@ contract LoadHandler is Test {
             vm.revertToState(snap);
             if (real != claimed) ghostUnlockMismatch += 1;
         } catch {}
+        vm.stopPrank();
+    }
+
+    /// Split out so the try/catch above has a single external call to wrap.
+    function callSeal(bool atomic) external {
+        require(msg.sender == address(this));
+        if (atomic) v.fundAndSeal(); else v.seal();
     }
 
     /// Nothing may leave an unsealed contract. Without this action the
@@ -84,8 +184,25 @@ contract LoadHandler is Test {
         try v.release(v.beneficiaryAt(bound(seed, 0, n - 1))) {} catch {}
     }
 
+    /**
+     * Time moves, but it does not cross TGE until the contract is sealed.
+     *
+     * Unbounded, it crossed within the first few calls of almost every run.
+     * addSchedule is closed from TGE onward by design, so the table could never
+     * be completed, the contract never sealed, and every property that only
+     * looks at a sealed contract passed having observed nothing. The coverage
+     * floor caught that, which is what it is for.
+     *
+     * Once sealed, time is free again, so the properties about adding at or
+     * after TGE still get exercised against a live contract.
+     */
     function warp(uint256 seed) external {
-        vm.warp(block.timestamp + bound(seed, 1, 5 days));
+        uint256 target = block.timestamp + bound(seed, 1, 5 days);
+        if (!v.sealed_()) {
+            uint256 ceiling = v.tgeTime() - 1;
+            if (target > ceiling) target = ceiling;
+        }
+        if (target > block.timestamp) vm.warp(target);
     }
 }
 
@@ -98,9 +215,47 @@ contract VestingLoadInvariants is Test {
     function setUp() public {
         vm.warp(1_800_000_000);
         t = new HCOWToken(treasury);
-        v = new HCOWVesting(address(t), block.timestamp + 10 days, treasury);
+
+        // The handler owns the table the contract is committed to, so build it
+        // first and deploy against it. The commitments are constructor
+        // arguments now: a campaign deployed against figures nothing could
+        // reach would never seal, and every property downstream of sealing
+        // would pass having observed nothing at all.
+        LoadHandler probe = new LoadHandler(HCOWVesting(address(0)), t, treasury);
+        (address[] memory b, uint128[] memory tt, uint16[] memory bps,
+         uint16[] memory clf, uint16[] memory lin) = probe.target();
+
+        v = new HCOWVesting(
+            address(t), block.timestamp + 10 days, treasury, address(0xFEE5),
+            b.length, Commit.totalOf(tt), Commit.unlockOf(tt, bps, clf, lin),
+            Commit.hashOf(b, tt, bps, clf, lin)
+        );
         handler = new LoadHandler(v, t, treasury);
         targetContract(address(handler));
+    }
+
+    /**
+     * Coverage floor, checked at the end of every run rather than as an
+     * invariant, because an invariant is also evaluated once before any call is
+     * made and would fail there by construction.
+     *
+     * The properties below that only look at a sealed contract are worthless on
+     * a run that never sealed. The audit found exactly that in the ProfitShare
+     * suite, where the guard written to make it visible asserted that an
+     * unsigned counter was at least zero, which is true of every value
+     * including zero, so it printed nothing and could not fail. This one can
+     * fail, and it did on the first campaign it was run against.
+     */
+    function afterInvariant() public view {
+        assertGt(handler.ghostSealed(), 0,
+            "this run never sealed, so every sealed-state property observed nothing");
+    }
+
+    /// The commitment is fixed before any row exists, so a table that is not
+    /// the committed one must never seal, however it was assembled.
+    function invariant_neverSealsOffCommitment() public view {
+        assertEq(handler.ghostSealedOffCommitment(), 0,
+            "a table that did not match the deployment commitment was sealed");
     }
 
     /// Nothing may be added once the set is final.
@@ -221,26 +376,98 @@ contract VestingLoadInvariants is Test {
      * a number.
      */
     function test_beneficiaryCapAndSealGas() public {
-        uint256 max = v.MAX_BENEFICIARIES();
+        uint256 max = 200; // HCOWVesting.MAX_BENEFICIARIES
+        address[] memory b = new address[](max);
+        uint128[] memory tt = new uint128[](max);
+        uint16[] memory bps = new uint16[](max);
+        uint16[] memory clf = new uint16[](max);
+        uint16[] memory lin = new uint16[](max);
+        for (uint256 i = 0; i < max; ++i) {
+            b[i] = address(uint160(0x50000 + i));
+            tt[i] = 1e18; bps[i] = 0; clf[i] = 0; lin[i] = 12;
+        }
+        HCOWVesting vv = new HCOWVesting(
+            address(t), block.timestamp + 10 days, treasury, address(0xFEE5),
+            max, Commit.totalOf(tt), Commit.unlockOf(tt, bps, clf, lin),
+            Commit.hashOf(b, tt, bps, clf, lin)
+        );
+
         vm.startPrank(treasury);
         for (uint256 i = 0; i < max; ++i) {
-            v.addSchedule(address(uint160(0x50000 + i)), 1e18, 0, 0, 12);
+            vv.addSchedule(b[i], tt[i], bps[i], clf[i], lin[i]);
         }
-        assertEq(v.beneficiaryCount(), max, "did not load the full cap");
+        assertEq(vv.beneficiaryCount(), max, "did not load the full cap");
         vm.expectRevert();
-        v.addSchedule(address(uint160(0x60000)), 1e18, 0, 0, 12);
+        vv.addSchedule(address(uint160(0x60000)), 1e18, 0, 0, 12);
 
-        t.transfer(address(v), v.totalScheduled());
-        uint256 scheduled = v.totalScheduled();
-        uint256 unlock = v.totalTgeUnlock();
-        bytes32 h = v.scheduleHash();
+        t.approve(address(vv), type(uint256).max);
         uint256 before = gasleft();
-        v.seal(max, scheduled, unlock, h);
+        vv.fundAndSeal();
         uint256 used = before - gasleft();
         vm.stopPrank();
-        assertTrue(v.sealed_(), "a full table could not be sealed");
+        assertTrue(vv.sealed_(), "a full table could not be sealed");
         // BSC blocks are far larger than this; the point is that it is a number.
         assertLt(used, 10_000_000, "sealing a full table costs more than ten million gas");
-        emit log_named_uint("seal() gas at MAX_BENEFICIARIES", used);
+        emit log_named_uint("fundAndSeal() gas at MAX_BENEFICIARIES", used);
+    }
+
+    /// replaceTable swaps the whole table so a mistyped row is recoverable, and
+    /// grants no power an unsealed owner did not already have.
+    function test_replaceTableRecoversAMistypedRow() public {
+        (address[] memory b, uint128[] memory tt, uint16[] memory bps,
+         uint16[] memory clf, uint16[] memory lin) = handler.target();
+
+        vm.startPrank(treasury);
+        v.addSchedule(b[0], tt[0] - 1e18, bps[0], clf[0], lin[0]); // mistyped
+        for (uint256 i = 1; i < b.length; ++i) v.addSchedule(b[i], tt[i], bps[i], clf[i], lin[i]);
+        t.approve(address(v), type(uint256).max);
+        vm.expectRevert();
+        v.fundAndSeal();
+
+        v.replaceTable(b, tt, bps, clf, lin);
+        assertEq(v.beneficiaryCount(), b.length, "the replacement is not the whole table");
+        assertEq(v.scheduleHash(), v.expectedScheduleHash(), "the replacement missed the commitment");
+
+        v.fundAndSeal();
+        vm.stopPrank();
+        assertTrue(v.sealed_(), "a corrected table could not be sealed");
+    }
+
+    /// The empty table is not reachable, funded or not. A bare clear created a
+    /// permanent total-loss path: clear a funded table, fail to rebuild it
+    /// before TGE, and addSchedule is closed, seal() reverts NoSchedules
+    /// forever, release() is gated on the seal, and there is no sweep.
+    function test_theEmptyTableIsNotReachable() public {
+        (address[] memory b, uint128[] memory tt, uint16[] memory bps,
+         uint16[] memory clf, uint16[] memory lin) = handler.target();
+        vm.startPrank(treasury);
+        for (uint256 i = 0; i < b.length; ++i) v.addSchedule(b[i], tt[i], bps[i], clf[i], lin[i]);
+
+        address[] memory none = new address[](0);
+        uint128[] memory noneT = new uint128[](0);
+        uint16[] memory noneS = new uint16[](0);
+        vm.expectRevert(HCOWVesting.NoSchedules.selector);
+        v.replaceTable(none, noneT, noneS, noneS, noneS);
+        assertEq(v.beneficiaryCount(), b.length, "the table was emptied");
+
+        // and dusting the contract does not disable the correction path
+        t.transfer(address(v), 1);
+        v.replaceTable(b, tt, bps, clf, lin);
+        assertEq(v.scheduleHash(), v.expectedScheduleHash(), "a dusted contract could not be corrected");
+        vm.stopPrank();
+    }
+
+    /// The table is frozen at TGE, and replaceTable must not be a way to
+    /// unfreeze it: sealing is permissionless from then on, and an owner able
+    /// to rewrite the table then could hold every beneficiary hostage.
+    function test_replaceTableRefusedAtTge() public {
+        (address[] memory b, uint128[] memory tt, uint16[] memory bps,
+         uint16[] memory clf, uint16[] memory lin) = handler.target();
+        vm.startPrank(treasury);
+        for (uint256 i = 0; i < b.length; ++i) v.addSchedule(b[i], tt[i], bps[i], clf[i], lin[i]);
+        vm.warp(v.tgeTime());
+        vm.expectRevert();
+        v.replaceTable(b, tt, bps, clf, lin);
+        vm.stopPrank();
     }
 }

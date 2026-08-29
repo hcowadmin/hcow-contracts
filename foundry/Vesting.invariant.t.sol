@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity 0.8.34;
 
 import {Test} from "forge-std/Test.sol";
 import {HCOWVesting} from "../contracts/HCOWVesting.sol";
+import {Commit} from "./Commit.sol";
 import {HCOWToken} from "../contracts/HCOWToken.sol";
 
 /**
@@ -99,24 +100,42 @@ contract VestingInvariants is Test {
         vm.warp(1_800_000_000);
         t = new HCOWToken(treasury);
         uint256 tge = block.timestamp + 10 days;
-        v = new HCOWVesting(address(t), tge, treasury);
 
-        // the published allocation, loaded exactly as the runbook says
+        // the published allocation
         address[] memory bens = new address[](9);
-        uint128[9] memory totals =
-            [uint128(60_000_000e18), 40_000_000e18, 20_000_000e18, 8_000_000e18,
-             12_000_000e18, 20_000_000e18, 16_000_000e18, 14_000_000e18, 10_000_000e18];
-        uint16[9] memory bps  = [uint16(1500), 750, 2500, 3750, 0, 0, 0, 5000, 0];
-        uint16[9] memory clf  = [uint16(0), 6, 0, 0, 0, 6, 12, 0, 12];
-        uint16[9] memory lin  = [uint16(12), 12, 3, 6, 24, 42, 36, 12, 36];
+        uint128[] memory totals = new uint128[](9);
+        uint16[] memory bps = new uint16[](9);
+        uint16[] memory clf = new uint16[](9);
+        uint16[] memory lin = new uint16[](9);
+        {
+            uint128[9] memory tt =
+                [uint128(60_000_000e18), 40_000_000e18, 20_000_000e18, 8_000_000e18,
+                 12_000_000e18, 20_000_000e18, 16_000_000e18, 14_000_000e18, 10_000_000e18];
+            uint16[9] memory bb = [uint16(1500), 750, 2500, 3750, 0, 0, 0, 5000, 0];
+            uint16[9] memory cc = [uint16(0), 6, 0, 0, 0, 6, 12, 0, 12];
+            uint16[9] memory ll = [uint16(12), 12, 3, 6, 24, 42, 36, 12, 36];
+            for (uint256 i = 0; i < 9; ++i) {
+                bens[i] = address(uint160(0x3000 + i));
+                totals[i] = tt[i]; bps[i] = bb[i]; clf[i] = cc[i]; lin[i] = ll[i];
+            }
+        }
+
+        // Derived from the table before deployment, not read back off a loaded
+        // contract. That read-back is exactly what the audit flagged.
+        v = new HCOWVesting(
+            address(t), tge, treasury, address(0xFEE5),
+            9,
+            Commit.totalOf(totals),
+            Commit.unlockOf(totals, bps, clf, lin),
+            Commit.hashOf(bens, totals, bps, clf, lin)
+        );
 
         vm.startPrank(treasury);
         for (uint256 i = 0; i < 9; ++i) {
-            bens[i] = address(uint160(0x3000 + i));
             v.addSchedule(bens[i], totals[i], bps[i], clf[i], lin[i]);
         }
-        t.transfer(address(v), v.totalScheduled());
-        v.seal(9, v.totalScheduled(), v.totalTgeUnlock(), v.scheduleHash());
+        t.approve(address(v), type(uint256).max);
+        v.fundAndSeal();
         vm.stopPrank();
 
         handler = new VestingHandler(v, t, bens);
@@ -177,17 +196,19 @@ contract VestingInvariants is Test {
      * looks like it means.
      */
     function test_ownerIsPowerlessAfterSeal() public {
-        // Read the arguments first. expectRevert applies to the very next
-        // call, and a view call inside an argument list is that next call.
-        uint256 scheduled = v.totalScheduled();
-        uint256 unlock = v.totalTgeUnlock();
-        bytes32 h = v.scheduleHash();
-
         vm.startPrank(treasury);
         vm.expectRevert();
         v.addSchedule(address(0xBEEF), 1e18, 0, 0, 12);
         vm.expectRevert();
-        v.seal(9, scheduled, unlock, h);
+        v.seal();
+        {
+            address[] memory none = new address[](1);
+            uint128[] memory noneT = new uint128[](1);
+            uint16[] memory noneS = new uint16[](1);
+            none[0] = address(0xBEEF); noneT[0] = 1e18;
+            vm.expectRevert();
+            v.replaceTable(none, noneT, noneS, noneS, noneS);
+        }
         vm.expectRevert();
         v.transferOwnership(address(0xBEEF));
         vm.expectRevert();
