@@ -1,0 +1,83 @@
+{
+  "meta": {
+    "name": "HCOW vesting — BSC testnet rehearsal",
+    "source": "claude/HCOW_Canonical_Facts.md, official vesting announcement. Nine schedules, 200,000,000 HCOW total.",
+    "warning": "TESTNET ONLY. Every beneficiary address below is a disposable wallet generated on 2026-09-02 and must never appear on mainnet.",
+    "totalsMustEqual": "200000000000000000000000000",
+    "tgeUnlockMustEqual": "27000000000000000000000000"
+  },
+  "rows": [
+    {
+      "label": "Public",
+      "beneficiary": "0x9c66437E77B79b68c20d542Dc5F6a06097a771F6",
+      "total": "60000000000000000000000000",
+      "tgeBps": 1500,
+      "cliffMonths": 0,
+      "linearMonths": 12
+    },
+    {
+      "label": "Private",
+      "beneficiary": "0xaa425383c8769205E55E16FaEFBEbCf6812999B3",
+      "total": "40000000000000000000000000",
+      "tgeBps": 750,
+      "cliffMonths": 6,
+      "linearMonths": 12
+    },
+    {
+      "label": "Seed",
+      "beneficiary": "0xF41aE33c69D4Bb9B25DeD7F25Dc4C7Ac723A131a",
+      "total": "20000000000000000000000000",
+      "tgeBps": 2500,
+      "cliffMonths": 0,
+      "linearMonths": 3
+    },
+    {
+      "label": "Community / Airdrop",
+      "beneficiary": "0x777ceeD1aEd13C8512CBd2FC7EdD44960b4c8d02",
+      "total": "8000000000000000000000000",
+      "tgeBps": 3750,
+      "cliffMonths": 0,
+      "linearMonths": 6
+    },
+    {
+      "label": "Community / Incentives",
+      "beneficiary": "0x6f952acd32080534aEd6aD225f1c712d6589a114",
+      "total": "12000000000000000000000000",
+      "tgeBps": 0,
+      "cliffMonths": 0,
+      "linearMonths": 24
+    },
+    {
+      "label": "Ecosystem & R&D",
+      "beneficiary": "0x651F6e372FfC95f9f7a504ee223589e390D7d074",
+      "total": "20000000000000000000000000",
+      "tgeBps": 0,
+      "cliffMonths": 6,
+      "linearMonths": 42
+    },
+    {
+      "label": "Foundation",
+      "beneficiary": "0x0e82E96207627387B48a3F0595DfFDEa53085b4F",
+      "total": "16000000000000000000000000",
+      "tgeBps": 0,
+      "cliffMonths": 12,
+      "linearMonths": 36
+    },
+    {
+      "label": "Liquidity",
+      "beneficiary": "0xE24DE555af42fb4AEBFaa940229Ece18f6A9Ce40",
+      "total": "14000000000000000000000000",
+      "tgeBps": 5000,
+      "cliffMonths": 0,
+      "linearMonths": 12
+    },
+    {
+      "label": "Team",
+      "beneficiary": "0x5e6291631a27CCF4DA21348f05f064c81549B2B0",
+      "total": "10000000000000000000000000",
+      "tgeBps": 0,
+      "cliffMonths": 12,
+      "linearMonths": 36
+    }
+  ]
+}
