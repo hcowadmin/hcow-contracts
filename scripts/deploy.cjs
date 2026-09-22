@@ -43,6 +43,37 @@ const addr = (k, { required = true } = {}) => {
   return ethers.getAddress(v);
 };
 
+/**
+ * 되읽기 비교를 순수 함수로 분리한 이유. (7차 감사 조치의 사보타주에서 나옴)
+ *
+ * 이 스크립트는 언제나 자기가 방금 보낸 인자로 배포한 컨트랙트를 읽는다.
+ * 그래서 어떤 비교도 정상 경로에서는 절대 틀리지 않는다 — 비교문을 통째로
+ * 지우고 전 스위트를 돌려도 초록이었다. 테스트가 약한 게 아니라 그 분기에
+ * 닿을 방법이 없는 것이다 (백로그 C-7). deploy-token.cjs 가 같은 이유로
+ * readbackFaults 를 분리했고 여기도 같은 처리를 한다.
+ *
+ * 인자는 체인에서 읽은 값(on)과 보냈어야 할 값(want)이다. 문자열 비교는
+ * 소문자로, 금액은 BigInt 로 한다.
+ */
+function readbackFaults(on, want) {
+  const bad = [];
+  const addrNe = (a, b) => String(a).toLowerCase() !== String(b).toLowerCase();
+  // token · rescueRecipient · supplyCap 은 전부 immutable 인데 7차 감사 전까지
+  // 되읽기가 한 번도 읽지 않았다. rescueRecipient 는 컨트랙트 주석이 직접
+  // "immutable 이고 봉인 후엔 owner 도 없으므로 여기서 틀리면 영구적" 이라고
+  // 적어둔 값이다.
+  if (addrNe(on.oTok, want.token)) bad.push(`token ${on.oTok}, expected ${want.token}`);
+  if (addrNe(on.oResc, want.rescue)) bad.push(`rescueRecipient ${on.oResc}, expected ${want.rescue}`);
+  if (BigInt(on.oCap) !== BigInt(want.supply)) bad.push(`supplyCap ${on.oCap}, expected the token supply ${want.supply}`);
+  if (BigInt(on.ob) !== BigInt(want.count)) bad.push(`expectedBeneficiaries ${on.ob}`);
+  if (BigInt(on.os) !== BigInt(want.total)) bad.push(`expectedScheduled ${on.os}`);
+  if (BigInt(on.ou) !== BigInt(want.unlock)) bad.push(`expectedTgeUnlock ${on.ou}`);
+  if (addrNe(on.oh, want.hash)) bad.push(`expectedScheduleHash ${on.oh}`);
+  if (addrNe(on.oo, want.treasury)) bad.push(`owner ${on.oo}, expected the treasury ${want.treasury}`);
+  if (BigInt(on.ot) !== BigInt(want.tge)) bad.push(`tgeTime ${on.ot}`);
+  return bad;
+}
+
 async function main() {
   const { provider, signer, net, mainnet } = await connect();
   const me = await signer.getAddress();
@@ -142,6 +173,47 @@ async function main() {
   console.log(`  TGE unlock     ${tok(c.unlock)} HCOW  (${(Number(c.unlock * 10000n / c.total) / 100).toFixed(2)}% of the table)`);
   console.log(`  hash           ${c.hash}\n`);
 
+  // ---- has any of this already been deployed? ---------------------------
+  //
+  // 7차 감사 C-1. 이 파일에는 재실행 가드가 한 줄도 없었다. HCOW_ADDRESS 를
+  // 빠뜨린 실행 하나가 두 번째 200,000,000 을 발행하고, 레코드의 HCOWToken 을
+  // 조용히 교체하고, exit 0 으로 끝났다. 새 베스팅은 새 토큰에 immutable 로
+  // 묶이고 이미 배포된 HCOWClaim 은 옛 토큰에 immutable 로 묶여 영원히 자금을
+  // 받지 못한다. 형제인 deploy-claim.cjs 와 deploy-token.cjs 는 둘 다 이
+  // 가드를 갖고 있었다.
+  //
+  // 이 세 검사는 전부 첫 배포 트랜잭션보다 앞에 있어야 한다. 거절된 실행이
+  // 체인에 토큰 하나를 남기면 가드가 절반만 작동한 것이다.
+  const chainIdNum = Number(net.chainId);
+  const priorRecord = readRecord(chainIdNum);
+  if (!priorRecord && process.env.FIRST_DEPLOY !== '1') {
+    throw new Error(
+      `no deployments/${chainIdNum}.json exists. That is what a first deploy looks like, and it is ` +
+      'also what a wiped or missing record looks like after something was already deployed here. ' +
+      'Every rerun guard below reads that record and none of them can run without it. If this really ' +
+      'is the first deploy on this chain, re-run with FIRST_DEPLOY=1. If it is not, restore the record.');
+  }
+  const record = priorRecord || {};
+  const recordedToken = record.addresses?.HCOWToken;
+  const recordedVesting = record.addresses?.HCOWVesting;
+
+  if (!process.env.HCOW_ADDRESS && recordedToken) {
+    throw new Error(
+      `deployments/${chainIdNum}.json already names HCOWToken at ${recordedToken}, and HCOW_ADDRESS ` +
+      'is not set. Deploying again mints a SECOND 200,000,000 supply and overwrites the pointer that ' +
+      'seal.cjs, release.cjs, deploy-claim.cjs and set-root.cjs all read. The vesting deployed in ' +
+      'this run would be bound to the new token while any HCOWClaim already deployed stays bound to ' +
+      'the old one, and neither can ever be changed. Set HCOW_ADDRESS to the token you mean, or, if ' +
+      'the recorded token really is to be abandoned, re-run with REPLACE_TOKEN=1.');
+  }
+  if (recordedVesting && process.env.REPLACE_VESTING !== '1') {
+    throw new Error(
+      `HCOWVesting is already recorded on chain ${chainIdNum} at ${recordedVesting}. Deploying again ` +
+      'produces a second vesting contract that holds nothing, and overwrites the record that ' +
+      'load.cjs, seal.cjs and release.cjs read. If the first one really is to be abandoned AND it ' +
+      'has not been sealed, re-run with REPLACE_VESTING=1.');
+  }
+
   // ---- token ------------------------------------------------------------
   let token = process.env.HCOW_ADDRESS ? ethers.getAddress(process.env.HCOW_ADDRESS) : null;
   let tokenTx = null;
@@ -160,6 +232,30 @@ async function main() {
   ]);
   console.log(`              ${sym}, ${dec} decimals, supply ${tok(supply)}, treasury holds ${tok(held)}`);
   if (Number(dec) !== 18) throw new Error(`token reports ${dec} decimals, the schedule is written in 18`);
+
+  // 7차 감사 C-2. 이전 판은 심볼을 출력하고 아무것도 비교하지 않았다. name 이
+  // "Tether USD" 이고 symbol 이 "USDT" 인 18자리 디코이가 그대로 통과해
+  // HCOWVesting.token 이 그것에 영구 바인딩됐다 (재현함, exit 0). 4차 감사
+  // C-4 가 deploy-claim.cjs 에 같은 검사를 넣었는데 이 형제는 고쳐지지 않았다.
+  if (sym !== 'HCOW') {
+    throw new Error(
+      `the token at ${token} calls itself ${JSON.stringify(sym)}, not "HCOW". HCOWVesting.token is ` +
+      'immutable, so a vesting contract bound to the wrong token can never release anything and its ' +
+      'rescue path moves the wrong asset.');
+  }
+  if (mainnet && supply !== 200_000_000n * 10n ** 18n) {
+    throw new Error(
+      `the token at ${token} reports a total supply of ${tok(supply)}, not 200,000,000. HCOW has a ` +
+      'fixed supply and no mint function, so this is not HCOW.');
+  }
+  // 레코드가 이미 아는 토큰과 HCOW_ADDRESS 가 다르면 이 스크립트는 고르지 않는다.
+  if (recordedToken && recordedToken.toLowerCase() !== token.toLowerCase()) {
+    throw new Error(
+      `HCOW_ADDRESS is ${token} but deployments/${chainIdNum}.json already names HCOWToken as ` +
+      `${recordedToken}. One of the two is wrong and this script will not pick. seal.cjs and ` +
+      'release.cjs read that record as the authoritative token address.');
+  }
+
   if (c.total > supply) throw new Error(`the table schedules ${tok(c.total)} but supply is ${tok(supply)}`);
   if (held < c.total) {
     throw new Error(
@@ -179,19 +275,16 @@ async function main() {
   // the arguments that were sent. A constructor argument encoded wrongly is
   // silent, and this is the last cheap moment to notice.
   const vc = at('HCOWVesting', vesting, provider);
-  const [ob, os, ou, oh, oo, ot] = await Promise.all([
+  const [ob, os, ou, oh, oo, ot, oTok, oResc, oCap] = await Promise.all([
     vc.expectedBeneficiaries(), vc.expectedScheduled(), vc.expectedTgeUnlock(),
     vc.expectedScheduleHash(), vc.owner(), vc.tgeTime(),
+    vc.token(), vc.rescueRecipient(), vc.supplyCap(),
   ]);
-  const bad = [];
-  if (ob !== c.count) bad.push(`expectedBeneficiaries ${ob}`);
-  if (os !== c.total) bad.push(`expectedScheduled ${os}`);
-  if (ou !== c.unlock) bad.push(`expectedTgeUnlock ${ou}`);
-  if (oh.toLowerCase() !== c.hash.toLowerCase()) bad.push(`expectedScheduleHash ${oh}`);
-  if (oo.toLowerCase() !== treasury.toLowerCase()) bad.push(`owner ${oo}, expected the treasury ${treasury}`);
-  if (ot !== BigInt(tge)) bad.push(`tgeTime ${ot}`);
+  const bad = readbackFaults(
+    { oTok, oResc, oCap, ob, os, ou, oh, oo, ot },
+    { token, rescue, supply, count: c.count, total: c.total, unlock: c.unlock, hash: c.hash, treasury, tge });
   if (bad.length) throw new Error('the deployed contract does not read back as deployed:\n  ' + bad.join('\n  '));
-  console.log('              commitments read back correctly from chain\n');
+  console.log('              commitments, token, rescueRecipient and supplyCap all read back correctly\n');
 
   const prev = readRecord(Number(net.chainId)) || {};
   const rec = {
@@ -214,7 +307,10 @@ async function main() {
     // 가드가 "기존 배포 없음" 으로 보고 조용히 풀리고, anchor.cjs 의
     // record.addresses?.HCOWAnchor 폴백도 같이 깨진다. 병합한다.
     addresses: { ...(prev.addresses || {}), HCOWToken: token, HCOWVesting: vesting },
+    // 7차 감사 M-6. 두 줄 위 addresses 는 3차 A-6 수정으로 병합하는데 이쪽은
+    // 재구성이라 HCOWClaim·HCOWAnchor 의 배포 tx 해시가 조용히 사라졌다.
     deploymentTxs: {
+      ...(prev.deploymentTxs || {}),
       ...(tokenTx ? { HCOWToken: tokenTx } : {}),
       HCOWVesting: v.deploymentTransaction().hash,
     },
@@ -230,7 +326,11 @@ async function main() {
   console.log('finish before then. seal() stays callable after TGE deliberately.');
 }
 
-main().catch((e) => {
-  console.error('\n' + (e.message || e));
-  process.exitCode = 1;
-});
+module.exports = { readbackFaults };
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error('\n' + (e.message || e));
+    process.exitCode = 1;
+  });
+}

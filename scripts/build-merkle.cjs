@@ -76,6 +76,37 @@ function loadRecipients(file) {
   return parseCsv(text);
 }
 
+// 7차 감사 M-8. 카테고리 쪽은 tgeBps/tailRounds 의 범위를 검사하는데 bucket 쪽은
+// 키의 존재만 봤다. bucket.tgeBps: 99999 한 글자로 vestedAt(TGE) 가 버킷 총액의
+// 10배를 돌려주고, check 6("베스팅이 풀기 전에 배포하지 않는다")이 통째로
+// 무력화된다 — 확인한다고 주장하면서 아무것도 확인하지 않는 검사가 된다.
+// 정책 파일은 손으로 편집하는 파일이고 예시 자신이 "복사해서 합의된 숫자를
+// 채워 넣으라" 고 지시한다. 오타 하나가 여기서 멈춰야 한다.
+//
+// loadPolicy 와 buildDistribution 양쪽에서 부른다. monthSeconds 검사가 이미
+// 같은 이유로 두 곳에 있다: buildDistribution 은 테스트와 메모리상 정책 객체가
+// 직접 호출하는 진입점이고, 파일을 거치지 않는다.
+function assertBucket(b) {
+  if (!/^\d+$/.test(String(b.total).trim())) {
+    throw new Error(`policy.bucket.total "${b.total}" must be an integer number of wei, written as a string`);
+  }
+  if (BigInt(String(b.total).trim()) === 0n) {
+    throw new Error('policy.bucket.total is 0, so check 6 would pass on any tree at all');
+  }
+  const bps = Number(b.tgeBps);
+  if (!Number.isInteger(bps) || bps < 0 || bps > 10000) {
+    throw new Error(
+      `policy.bucket.tgeBps must be 0..10000, got ${b.tgeBps}. Out of range it makes vestedAt ` +
+      'return more than the bucket holds, and check 6 then passes on any tree.');
+  }
+  for (const k of ['cliffMonths', 'linearMonths']) {
+    const v = Number(b[k]);
+    if (!Number.isInteger(v) || v < 0) {
+      throw new Error(`policy.bucket.${k} must be a non-negative integer, got ${b[k]}`);
+    }
+  }
+}
+
 function loadPolicy(file) {
   const p = JSON.parse(fs.readFileSync(file, 'utf8'));
 
@@ -102,6 +133,7 @@ function loadPolicy(file) {
   for (const k of ['total', 'tgeBps', 'cliffMonths', 'linearMonths']) {
     if (b[k] === undefined) throw new Error(`policy.bucket.${k} is required; it is what check 6 measures against`);
   }
+  assertBucket(b);
   return p;
 }
 
@@ -169,6 +201,7 @@ function buildDistribution(rawRows, policy, { tgeTime } = {}) {
   if (month !== 30 * 24 * 60 * 60) {
     throw new Error(`monthSeconds is ${month}; it must be 2592000, the 30-day month HCOWVesting uses`);
   }
+  assertBucket(policy.bucket || {});
   const tge = Number(tgeTime ?? policy.tgeTime);
   if (!Number.isInteger(tge) || tge <= 0) {
     throw new Error('tgeTime is required, in unix SECONDS. Pass --tge or set it in the policy file.');
@@ -197,6 +230,17 @@ function buildDistribution(rawRows, policy, { tgeTime } = {}) {
         `${where}: ${r.account} is not checksummed. Expected ${account}. ` +
         'Checksums are the only thing standing between a typo and a burn, so they are required, not normalised away.');
     }
+    // 7차 감사 H-6. 영 주소는 전부 0이라 대문자가 없고, 그래서 EIP-55 검사를
+    // 통과한다. 트리에 들어가면 그 리프는 ERC20 의 zero-receiver 거부로 영구히
+    // 리버트하고 isClaimed 도 찍히지 않는다. 풀이 고정이므로 그 지분만큼
+    // 진짜 수취인들이 받지 못한다. 재현 확인: 500 HCOW 리프가 수락됐고
+    // 빌더는 "grand total exact" 를 출력했다.
+    if (account === ethers.ZeroAddress) {
+      throw new Error(
+        `${where}: the zero address is not a recipient. It passes the EIP-55 check because it has ` +
+        'no uppercase to get wrong, and the leaf it produces can never be claimed: ERC20 refuses a ' +
+        'zero receiver, so the claim reverts forever and that share is lost to the real recipients.');
+    }
     const prev = seen.get(account);
     if (prev) {
       throw new Error(
@@ -206,6 +250,18 @@ function buildDistribution(rawRows, policy, { tgeTime } = {}) {
     }
     seen.set(account, r.line);
 
+    // 7차 감사 H-7. String() 을 먼저 하면 JSON 숫자형이 이미 IEEE754 로
+    // 뭉개진 뒤라 그 다음의 어떤 검사도 소용이 없다. 재현 확인:
+    // 2123953952678305934 -> "2123953952678306000" (+66 wei), 검사 7개 전부 통과.
+    // 위험 구간이 정확히 1e18~1e21, 즉 개인 배분 금액대다. 작은 값도 예외를
+    // 두지 않는다 — 두면 "작은 값은 괜찮다" 를 배우게 되고 큰 값에서 조용히 틀린다.
+    if (typeof r.totalAmount === 'number') {
+      throw new Error(
+        `${where}: totalAmount is a JSON number (${r.totalAmount}). Write it as a quoted string. ` +
+        'A number above 2^53 has already lost its exact value before this script sees it, and wei ' +
+        'amounts in this distribution are around 1e18 to 1e21, so the loss lands exactly on the ' +
+        'per-person figures.');
+    }
     const raw = String(r.totalAmount ?? '').trim();
     if (!/^\d+$/.test(raw)) {
       throw new Error(`${where}: totalAmount "${r.totalAmount}" must be an integer number of wei — no decimal point, no units, no separators`);

@@ -125,14 +125,27 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *     unopened round can be pushed back; it can no longer be pushed past the
  *     deadline.
  *
+ *     That bound is only as strong as claimDeadline. Audit 7 (2026-09-22)
+ *     found extendDeadline unbounded and reproduced the consequence: the owner
+ *     raised claimDeadline to 2^256-1 and then pushed a registered, publicly
+ *     announced round to the same era, leaving 200,000 HCOW both unclaimable
+ *     and unsweepable while the owner took the balance by the note 4 route.
+ *     extendDeadline is now bounded by MAX_DEADLINE_HORIZON from the calling
+ *     block. That limits how far one call reaches, not how many calls are
+ *     made, so the honest long-running case still works and the multisig plus
+ *     the event log remain what note 4 says they are: the real constraint.
+ *
  */
 contract HCOWClaim is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    /// @notice A deadline further out than this at deployment is a typo, not a
-    ///         plan, and claimDeadline cannot be shortened afterwards.
-    ///         extendDeadline is deliberately not bounded by it: extending is
-    ///         only ever more generous to claimants.
+    /// @notice A deadline further out than this is a typo, not a plan, and
+    ///         claimDeadline cannot be shortened afterwards. It bounds the
+    ///         constructor and extendDeadline alike, measured from the calling
+    ///         block in both. An earlier version exempted extendDeadline on the
+    ///         grounds that extending is only ever more generous to claimants;
+    ///         audit 7 showed that is false, because setRoot's upper bound is
+    ///         derived from claimDeadline.
     uint256 public constant MAX_DEADLINE_HORIZON = 3650 days;
 
     /// @notice Bounds on the notice period a round must be given before it can
@@ -467,16 +480,41 @@ contract HCOWClaim is Ownable2Step, ReentrancyGuard {
     /// @notice Move the claim deadline later. Strictly later: equal is refused
     ///         so that no event claims a change that did not happen, and
     ///         earlier is refused because that is confiscation.
+    ///
+    /// @dev    Bounded by MAX_DEADLINE_HORIZON from NOW, not from deployment.
+    ///         The bound is on how far one call may reach, not on how many
+    ///         times it may be called: a year from now the horizon has moved a
+    ///         year too, so a distribution that genuinely runs long can keep
+    ///         extending. What it closes is the two things an unbounded version
+    ///         allowed, both found by adversarial audit 7 (2026-09-22):
+    ///
+    ///           - a milliseconds-for-seconds typo, the exact mistake the
+    ///             constructor calls "a typo, not a plan", permanently killing
+    ///             sweep(). An earlier version of this comment exempted this
+    ///             function from the horizon on the grounds that "extending is
+    ///             only ever more generous to claimants". That was false.
+    ///           - pushing claimDeadline out of reach and then, because
+    ///             setRoot's upper bound is derived from it, pushing a
+    ///             registered round past every claimant's lifetime while
+    ///             sweep() stays shut. Reproduced: two owner calls left
+    ///             200,000 HCOW unclaimable and unsweepable at once.
     function extendDeadline(uint256 newDeadline) external onlyOwner {
         uint256 old = claimDeadline;
         if (newDeadline <= old) revert DeadlineNotExtended(old, newDeadline);
+        uint256 maxDeadline = block.timestamp + MAX_DEADLINE_HORIZON;
+        if (newDeadline > maxDeadline) revert DeadlineTooFar(newDeadline, maxDeadline);
         claimDeadline = newDeadline;
         emit DeadlineExtended(old, newDeadline);
     }
 
     /// @notice Recover unclaimed tokens, only once claimDeadline has arrived.
-    ///         This is the owner's only path to the balance, and it does not
-    ///         exist before the deadline.
+    ///         It does not exist before the deadline, with no override.
+    ///
+    ///         It is NOT the owner's only path to the balance. An earlier
+    ///         version of this notice said it was, which contradicted design
+    ///         note 4 eighty lines above in this same file; audit 7 found the
+    ///         sentence still here and in README.md. setRoot is the second
+    ///         path and note 4 says why it cannot be closed.
     function sweep(address to, uint256 amount) external onlyOwner nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();

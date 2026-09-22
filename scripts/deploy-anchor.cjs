@@ -29,7 +29,7 @@
 // need the new owner to accept, so a wrong owner here is recoverable while the
 // old key is still held.
 
-const { connect, deploy, at, writeRecord, readRecord, ethers } = require('./_connect.cjs');
+const { connect, deploy, at, writeRecord, readRecord, ethers, suppressed } = require('./_connect.cjs');
 
 const addr = (k) => {
   const v = process.env[k];
@@ -110,6 +110,20 @@ async function main() {
   console.log(`          ${ethers.formatEther(pubBal)} BNB`);
   if (pubBal === 0n) {
     console.log('          WARNING: the publisher has no BNB and cannot anchor until it is funded.');
+  }
+
+  // 7차 감사 H-5. 이 스크립트에는 드라이런이 아예 없었다. dryFlag 를 import
+  // 조차 하지 않아 DRY_RUN=yes 도 PRINT_ONLY=yes 도 정의되지 않은 환경변수로
+  // 무시되고 실제 배포가 나갔다. deploy-token.cjs 헤더가 "새 스크립트는 이
+  // 결함을 물려받으면 안 된다" 고 적어둔 바로 그 결함이다. 여기는 모든 검사가
+  // 끝난 지점이므로, 드라이런은 "전부 통과했고 이 인자로 배포한다" 를 보여준다.
+  if (suppressed()) {
+    console.log('\nDRY RUN. Every check above passed. These are the constructor arguments that');
+    console.log('would be used, and nothing has been sent or written:');
+    console.log(`  owner      ${owner}`);
+    console.log(`  publisher  ${publisher}`);
+    console.log('\nRe-run without DRY_RUN / PRINT_ONLY to deploy.');
+    return;
   }
 
   const c = await deploy('HCOWAnchor', signer, [owner, publisher]);

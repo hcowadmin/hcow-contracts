@@ -19,7 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { connect, at, sendOrPrint, readRecord, ethers, dryFlag } = require('./_connect.cjs');
+const { connect, at, sendOrPrint, readRecord, ethers, dryFlag, suppressed } = require('./_connect.cjs');
 const { buildRound, verifyProof, leafB } = require('./merkle.cjs');
 
 const E = 10n ** 18n;
@@ -125,7 +125,16 @@ async function main() {
   }
   // 1900000000000 is 'seconds' that are really milliseconds: ~year 62178. The
   // contract accepts it and the round then never opens. (Audit 4, M-10.)
+  // 7차 감사 M-3. 이 값은 검증되지 않았다. Number('3650d') 은 NaN 이고
+  // x > NaN 은 항상 false 라, 오타 한 글자가 아래 가드를 통째로 껐다.
+  // 22줄 위 LEAD_SECONDS 는 Number.isInteger 로 검증한다. 형제 간 불일치였다.
   const MAX_AHEAD = Number(process.env.MAX_AHEAD_SECONDS ?? 3650 * 86400);
+  if (!Number.isInteger(MAX_AHEAD) || MAX_AHEAD <= 0) {
+    throw new Error(
+      `MAX_AHEAD_SECONDS must be a positive whole number of seconds, got ` +
+      `${JSON.stringify(process.env.MAX_AHEAD_SECONDS)}. Anything else reads as NaN and silently ` +
+      'disables the check that a millisecond timestamp never reaches setRoot.');
+  }
   if (tree.startTime - nowTs > MAX_AHEAD) {
     throw new Error(
       `round ${roundId} opens at ${new Date(tree.startTime * 1000).toISOString()}, ` +
@@ -149,7 +158,9 @@ async function main() {
     console.log(`          WARNING: the round pays ${hcow(total)} HCOW and only ${hcow(held)} is here. ` +
                 'ALLOW_UNDERFUNDED is set, so this is going ahead.');
   }
-  if (!dryFlag('PRINT_ONLY') && owner.toLowerCase() !== me.toLowerCase()) {
+  // 7차 감사 H-3. 이 스크립트는 PRINT_ONLY 만 알고 DRY_RUN 을 몰랐다.
+  // DRY_RUN=yes 는 정의되지 않은 환경변수로 무시되고 setRoot 가 실제로 나갔다.
+  if (!suppressed() && owner.toLowerCase() !== me.toLowerCase()) {
     throw new Error(`TREASURY_KEY is ${me} but the owner is ${owner}. Use PRINT_ONLY=yes and sign from the Safe.`);
   }
 

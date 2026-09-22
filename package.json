@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "compile": "node compile.cjs",
-    "test": "node compile.cjs && node test.cjs && node audit.cjs && node test/HCOWClaim.test.cjs && node test/claim-boundaries.test.cjs && node test/build-merkle.test.cjs && node test/builder-guards.test.cjs && node test/ops-guards.test.cjs && node test/HCOWAnchor.test.cjs && forge test",
+    "test": "node compile.cjs && node test.cjs && node audit.cjs && node test/HCOWClaim.test.cjs && node test/claim-boundaries.test.cjs && node test/build-merkle.test.cjs && node test/builder-guards.test.cjs && node test/ops-guards.test.cjs && node test/HCOWAnchor.test.cjs && node test/deploy-token.test.cjs && forge test",
     "test:claim": "node compile.cjs && node test/HCOWClaim.test.cjs && node test/claim-boundaries.test.cjs && node test/build-merkle.test.cjs && node test/builder-guards.test.cjs && node test/ops-guards.test.cjs",
     "test:fuzz": "forge test",
     "test:fuzz:deep": "FOUNDRY_PROFILE=deep forge test",

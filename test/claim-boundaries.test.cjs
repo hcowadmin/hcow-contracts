@@ -460,6 +460,54 @@ async function main() {
     eq(errName(ci, rightNow), 'NoticeTooShort', 'and so is one that opens in this very block');
   }
 
+
+  // -------------------------------------------- extendDeadline 의 상한 (7차 H-1)
+  console.log('\n11. extendDeadline 에 상한이 있다  (7차 감사 H-1)\n');
+  {
+    // 7차 감사에서 재현한 공격: 상한이 없으면 owner 의 합법 호출 두 번으로
+    // 등록·공개된 회차가 영구 청구 불가가 되고 sweep 도 같이 영구 봉쇄된다.
+    //   extendDeadline(2^256-1)  →  setRoot(같은 회차, 2^256-1-window)
+    // 그 뒤 owner 는 note 4 경로로 잔액 전부를 가져간다.
+    const NOTICE2 = 3600n, W = 30n * DAY, D = now + 400n * DAY;
+    const c11 = await deployC('HCOWClaim', ci, [token.toString(), A(0), D, NOTICE2, W]);
+    const horizon = 3650n * DAY;
+
+    const far = await send({ to: c11, data: ci.encodeFunctionData('extendDeadline', [(1n << 256n) - 1n]) });
+    eq(errName(ci, far), 'DeadlineTooFar', '2^256-1 로의 연장은 거부된다  (kills 상한 삭제)');
+
+    const overBy1 = await send({ to: c11, data: ci.encodeFunctionData('extendDeadline', [now + horizon + 1n]) });
+    eq(errName(ci, overBy1), 'DeadlineTooFar', '지평선보다 1초 먼 연장도 거부된다  (kills > vs >=)');
+
+    const atMax = await send({ to: c11, data: ci.encodeFunctionData('extendDeadline', [now + horizon]) });
+    ok(!atMax.execResult.exceptionError, '정확히 지평선까지는 허용된다');
+    eq(await read(ci, c11, 'claimDeadline', []), now + horizon, '그리고 실제로 반영된다');
+
+    // 상한은 "한 번에 얼마나 멀리" 이지 "몇 번" 이 아니다. 시간이 지나면 다시 늘릴 수 있다.
+    const before = now;
+    now += 100n * DAY;
+    const again = await send({ to: c11, data: ci.encodeFunctionData('extendDeadline', [now + horizon]) });
+    ok(!again.execResult.exceptionError, '시간이 지나면 다시 지평선까지 늘릴 수 있다 — 연장 횟수는 제한하지 않는다');
+    now = before;
+
+    // 단축은 여전히 불가능하다. 공개 약속이다.
+    const back = await send({ to: c11, data: ci.encodeFunctionData('extendDeadline', [now + DAY]) });
+    eq(errName(ci, back), 'DeadlineNotExtended', '단축은 여전히 거부된다');
+
+    // 그리고 7차 H-1 의 공격 자체가 성립하지 않는다.
+    const c12 = await deployC('HCOWClaim', ci, [token.toString(), A(0), D, NOTICE2, W]);
+    await send({ to: token, data: ti.encodeFunctionData('transfer', [c12.toString(), 200n * E]) });
+    const t12 = twoLeaf(1n, { index: 0n, account: A(1), amount: 100n * E }, { index: 1n, account: A(2), amount: 100n * E });
+    await send({ to: c12, data: ci.encodeFunctionData('setRoot', [1n, t12.root, now + 60n * DAY]) });
+    const evil = await send({ to: c12, data: ci.encodeFunctionData('extendDeadline', [(1n << 255n)]) });
+    eq(errName(ci, evil), 'DeadlineTooFar', '공격의 1단계가 막힌다');
+    const push = await send({ to: c12, data: ci.encodeFunctionData('setRoot', [1n, t12.root, (1n << 255n) - W]) });
+    eq(errName(ci, push), 'ClaimWindowTooShort', '그리고 2단계도 여전히 막혀 있다');
+    now += 60n * DAY;
+    const paid = await send({ to: c12, data: ci.encodeFunctionData('claim', [1n, 0n, A(1), 100n * E, t12.p ? t12.p[0] : t12.proofs[0]]) });
+    ok(!paid.execResult.exceptionError, '예정대로 개시일에 A1 이 청구한다');
+    now -= 60n * DAY;
+  }
+
   console.log(`\n${pass} passed, ${fail} failed\n`);
   process.exit(fail === 0 ? 0 : 1);
 }

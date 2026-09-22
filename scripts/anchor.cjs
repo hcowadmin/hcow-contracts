@@ -30,7 +30,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { connect, at, readRecord, ethers, dryFlag } = require('./_connect.cjs');
+const { connect, at, readRecord, ethers, dryFlag, suppressed } = require('./_connect.cjs');
 const { buildBatch, PERIOD } = require('./anchor-merkle.cjs');
 
 function loadRounds(file) {
@@ -122,7 +122,10 @@ async function assertPeriodEnded(periodStart, provider) {
 }
 
 async function main() {
-  const dryRun = dryFlag('DRY_RUN');
+  // 7차 감사 H-4. 이 스크립트는 DRY_RUN 만 알고 PRINT_ONLY 를 몰랐다. 저장소가
+  // PRINT_ONLY 를 표준어로 쓰는 스크립트가 넷이라 운영자가 그 이름을 익히게 되어
+  // 있고, 여기서는 그게 무시되어 첫 앵커가 제네시스 시각을 영구히 고정했다.
+  const dryRun = suppressed();
   // keyVar 를 넘기지 않으면 _connect.cjs 가 DEPLOYER_KEY 를 읽는다. 헤더는
   // PUBLISHER_KEY 를 쓰라고 하는데 코드는 배포키로 서명을 시도했고, DRY_RUN 에서는
   // publisher 확인도 건너뛰어 드라이런이 조용히 통과했다. 감사 A-M1.

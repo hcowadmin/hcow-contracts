@@ -1,21 +1,37 @@
-# HCOW Contracts — HCOWToken, HCOWVesting and HCOWClaim
+# HCOW Contracts — HCOWToken, HCOWVesting, HCOWClaim and HCOWAnchor
 
 Reference implementations written by HashCow. Solidity 0.8.34, OpenZeppelin 5.0.2.
-The first two compile clean with zero warnings and pass 161 assertions, plus 20 Foundry tests including 13 invariant properties. Measured 29 August 2026.
-`HCOWClaim` was added afterwards and is covered by 139 further assertions of its own; it is
-additive and changes nothing about the two contracts above.
+The first two compile clean with zero warnings and pass 161 assertions, plus 20 Foundry tests
+(14 invariant properties + 6 tests). `HCOWClaim` and `HCOWAnchor` were added afterwards and are
+additive: they change nothing about the two contracts above.
+
+**682 assertions across nine suites, all green. Measured 22 September 2026.**
 
 ```
-npm test           # compiles, runs both suites below, then forge test
+npm test           # compiles, runs every suite below, then forge test
 node compile.cjs   # solc 0.8.34 pinned, optimizer on, 200 runs, evmVersion paris
-node test.cjs      # functional suite, 94 assertions, in-process EVM
-node audit.cjs     # adversarial and property suite, 67 assertions
-node test/HCOWClaim.test.cjs     # the sixteen tests of the claim spec, 108 assertions
-node test/build-merkle.test.cjs  # the seven tree-generator checks, 31 assertions
+
+node test.cjs                        # functional, token and vesting          94
+node audit.cjs                       # adversarial and property               67
+node test/HCOWClaim.test.cjs         # the sixteen tests of the claim spec   108
+node test/claim-boundaries.test.cjs  # the claim contract at its edges        82
+node test/build-merkle.test.cjs      # the seven tree-generator checks        31
+node test/builder-guards.test.cjs    # the generator's own guards             35
+node test/ops-guards.test.cjs        # the operator scripts, run for real    109
+node test/HCOWAnchor.test.cjs        # the round anchor                       93
+node test/deploy-token.test.cjs      # the token-only deploy script           63
+                                                                      total  682
+
 forge test         # 14 machine-searched invariants + 6 tests, 32,768 calls each
 npm run test:fuzz:deep   # the same, 2000 runs x 400 calls
 npm run test:mutate      # deletes each guard in turn and checks the suite notices
 ```
+
+`test/ops-guards.test.cjs` runs the real operator scripts as child processes
+against an in-process chain, so a guard that only exists in a comment fails
+there. Audit 7 (2026-09-22) added 22 cases to it for `deploy.cjs`, which until
+then had never been audited at all even though it is the only sanctioned
+mainnet deployment path.
 
 **The compiler is pinned, and pinned to the same version `hcow-protocol` uses.**
 Both repositories are audited and deployed together, and a compiler difference
@@ -367,7 +383,7 @@ Recipients claim themselves, from `app.hash-cow.io`, paying their own gas.
 Nothing is pushed.
 
 ```
-HCOWClaim(token, owner, claimDeadline)     4,625 bytes deployed
+HCOWClaim(token, owner, claimDeadline, minRoundNotice, minClaimWindow)     5,103 bytes deployed
 ```
 
 Uniswap's `MerkleDistributor` is the reference implementation and the claim
@@ -383,7 +399,7 @@ one contract serves every unlock round of every airdrop category.
 | A root can still be corrected before the round opens | And every correction emits `RoundSet`, so a rewrite cannot happen quietly |
 | One claim per round per entry | Per-round bitmap. Rounds share nothing, so a claimed round 0 does not close round 1 |
 | A failed transfer never marks an entry claimed | The balance is checked first and the entry is marked before the transfer, so an underfunded round reverts whole with `InsufficientBalance` and the bit is rolled back with it. This is the standard permanent-loss bug in multi-round distributors, and test 9 is the one that proves it is absent |
-| The owner's only route to the tokens is `sweep`, and it is shut until `claimDeadline` | There is no other transfer path out of this contract |
+| `sweep` is shut until `claimDeadline`, with no override | But it is **not** the owner's only route to the tokens, and this table used to say it was. `setRoot` is the second route: the owner can register an unused round whose tree pays one address the balance, wait out `minRoundNotice`, and claim it. That is a property of every distributor whose operator chooses the root, and design note 4 in the contract sets out what is enforced instead. Do not read this row as more than it says |
 | The deadline extends, never shortens | `extendDeadline` refuses anything at or below the current value. A shortenable deadline is confiscation on notice |
 | `minClaimAmount` is raised only before the first round opens | Afterwards it moves down and never up, reverting with `MinClaimAmountRaiseClosed`. A floor raised over a live distribution excludes exactly the small recipients the floor exists to spare gas, which is shortening the deadline reached by another route |
 | Ownership cannot be renounced | Renouncing would end `setRoot` too, so no later round could ever open and everything still owed would be stranded |
@@ -471,15 +487,35 @@ This extends the list above; steps 1-3 there are unchanged.
 ```
 
 ```bash
-RPC_URL=... CHAIN_ID=97 DEPLOYER_KEY=0x... HCOW_ADDRESS=0x... CLAIM_OWNER=0x<treasury Safe> CLAIM_DEADLINE=<unix seconds> node scripts/deploy-claim.cjs
+RPC_URL=... CHAIN_ID=97 DEPLOYER_KEY=0x... HCOW_ADDRESS=0x... \
+  CLAIM_OWNER=0x<treasury Safe> CLAIM_DEADLINE=<unix seconds> \
+  CLAIM_NOTICE_SECONDS=259200 CLAIM_WINDOW_SECONDS=7776000 \
+  node scripts/deploy-claim.cjs
 ```
+
+`CLAIM_NOTICE_SECONDS` and `CLAIM_WINDOW_SECONDS` are required and both are
+**immutable after deployment**. Neither appeared in this file until audit 7,
+so the command above used to fail on a missing variable when copied.
+
+| | what it is | range | recommended |
+|---|---|---|---|
+| `CLAIM_NOTICE_SECONDS` | how far ahead a round's `startTime` must be when `setRoot` is called | 3,600 to 2,592,000 | 259200 (72 h). Mainnet refuses under a day |
+| `CLAIM_WINDOW_SECONDS` | how long every round stays claimable before `sweep` can open | 3,600 to 31,536,000 | 7776000 (90 d). Mainnet refuses under 30 days |
+
+The one-hour floors exist so a testnet rehearsal fits in an afternoon. The
+script refuses both of them on mainnet.
 
 **Step 2 is the point of no return.** `seal()` fixes every beneficiary forever,
 so `HCOWClaim` has to exist and be final before sealing. Deploy it before
 `scripts/load.cjs` runs, not between loading and sealing. `deploy-claim.cjs`
 reads `sealed_()` and refuses to deploy against an already-sealed vesting
 contract, because a claim contract deployed after the seal looks correct,
-verifies on BscScan, and silently never receives a token.
+verifies on BscScan, and silently never receives a token. **That check is
+conditional, not unconditional**: it needs `deployments/<chain>.json` to name
+`HCOWVesting`, and in the deployment order this repository actually uses the
+claim contract is deployed before vesting exists. Then the script prints
+`vesting not recorded for this chain; cannot check whether it is sealed` and
+proceeds. Read that line when it appears; it means this guard did not run.
 
 `claimDeadline` is passed here and can only ever move later. Set it long.
 
@@ -503,12 +539,18 @@ submitted through the Safe.
 
 ### Operational cautions
 
-- **`startTime` is not validated against the current block, on purpose.** A
-  queued Safe transaction executes minutes or days after it is prepared, and a
-  freshness check would reject the correct call for being late. The cost is
-  that a round registered with a `startTime` already past opens and freezes in
-  the same block, with no window to correct the root. `set-root.cjs` refuses
-  that case; a call assembled by hand has nothing to catch it.
+- **`startTime` is not checked for freshness, on purpose, but it is bounded on
+  both sides.** A queued Safe transaction executes minutes or days after it is
+  prepared, and a freshness check would reject the correct call for being late.
+  So there is no "this call is stale" rule. There are two range rules instead:
+  `startTime` must be at least `minRoundNotice` ahead (`NoticeTooShort`), so no
+  round can open in the block it was registered and every root is a public
+  `RoundSet` before it can pay anyone; and it must be at least
+  `minClaimWindow` before `claimDeadline` (`ClaimWindowTooShort`), so `sweep`
+  never opens against a round nobody could claim yet. An earlier version of
+  this paragraph said a round with a `startTime` already past opens and freezes
+  in the same block. `minRoundNotice` ended that case and the sentence was left
+  behind; it is corrected here rather than defended.
 - **Register a round before the tokens for it arrive, not after.** Claims
   against an underfunded round revert cleanly and cost the claimant gas for
   nothing, which is an annoyance. The reverse — opening late — is worse only in

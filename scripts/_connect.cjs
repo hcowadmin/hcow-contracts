@@ -105,10 +105,29 @@ function dryFlag(name) {
   const v = String(raw).trim().toLowerCase();
   if (DRY_YES.has(v)) return true;
   if (DRY_NO.has(v)) return false;
+  // 7차 감사 L-2. 이 함수는 억제 플래그(DRY_RUN·PRINT_ONLY)와 활성 플래그
+  // (REPLACE_CLAIM·ALLOW_UNDERFUNDED…) 양쪽에 쓰인다. 예전 문구는 "억제하려면
+  // yes 를 쓰라" 고만 말해서, 활성 플래그에 대해서는 방향을 정반대로 안내했다.
+  // 동작은 어느 쪽이든 fail-closed 지만 안내문이 거짓이면 안 된다.
   throw new Error(
     `${name}=${JSON.stringify(raw)} is not a value this script understands. ` +
-    `Use one of ${[...DRY_YES].join(' / ')} to suppress the transaction, or unset it to send. ` +
+    `Use one of ${[...DRY_YES].join(' / ')} to turn ${name} ON, one of ` +
+    `${[...DRY_NO].filter(Boolean).join(' / ')} to turn it off, or unset it. ` +
     'Refusing to guess, because guessing wrong here sends a real transaction.');
+}
+
+/**
+ * The two names this repository uses for "do not send anything".
+ *
+ * 7차 감사 H-3 · H-4 · H-5. Each script had picked one name and silently
+ * ignored the other: set-root.cjs knew PRINT_ONLY and not DRY_RUN, anchor.cjs
+ * the reverse, deploy-anchor.cjs neither. An operator who learned one name
+ * from one script and typed it at another got a real, irreversible
+ * transaction while believing it was a rehearsal. Both names now mean the same
+ * thing everywhere, and an unrecognised spelling of either still throws.
+ */
+function suppressed() {
+  return dryFlag('DRY_RUN') || dryFlag('PRINT_ONLY');
 }
 
 /**
@@ -122,7 +141,7 @@ function dryFlag(name) {
 async function sendOrPrint(label, contract, method, args, { from }) {
   const data = contract.interface.encodeFunctionData(method, args);
   const to = await contract.getAddress();
-  if (dryFlag('PRINT_ONLY')) {
+  if (suppressed()) {
     console.log(`\n  ${label}`);
     console.log(`    from   ${from}`);
     console.log(`    to     ${to}`);
@@ -136,4 +155,4 @@ async function sendOrPrint(label, contract, method, args, { from }) {
   return rc;
 }
 
-module.exports = { connect, artifact, deploy, at, readRecord, writeRecord, sendOrPrint, dryFlag, ethers, BSC_MAINNET, BSC_TESTNET };
+module.exports = { connect, artifact, deploy, at, readRecord, writeRecord, sendOrPrint, dryFlag, suppressed, ethers, BSC_MAINNET, BSC_TESTNET };

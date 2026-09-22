@@ -229,6 +229,54 @@ function build(tamper) {
       'and the message says so');
   }
 
+
+  // ------------------------------------------- 7차 감사 H-6 / H-7 / M-8
+  console.log('\n수취인 주소와 금액의 형태  (7차 감사 H-6 / H-7)\n');
+  {
+    const { buildDistribution } = loadBuilder(null);
+    const thrown = (rows, policy = POLICY) => {
+      try { buildDistribution(rows, policy, { tgeTime: TGE }); return null; }
+      catch (e) { return e.message; }
+    };
+
+    // H-6. address(0) 은 EIP-55 체크섬 검사를 통과한다 (전부 0이므로 대문자가 없다).
+    // 트리에 들어가면 그 리프는 ERC20InvalidReceiver 로 영구 리버트하고,
+    // 풀이 고정이므로 그 지분만큼 진짜 수취인들이 못 받는다.
+    const zero = '0x' + '0'.repeat(40);
+    const mZero = thrown([...ROWS, { account: zero, category: 'flat', totalAmount: (500n * E).toString() }]);
+    ok(mZero !== null, 'address(0) 수취인이 거부된다');
+    ok(mZero !== null && /zero address|0x0{40}/i.test(mZero), '그리고 메시지가 영 주소를 지목한다');
+
+    // 0x…dEaD 같은 소각 주소는 일부러 거부하지 않는다. 그쪽은 transfer 가
+    // 성공하므로 컨트랙트 차원의 오류가 아니고, 무엇을 소각 주소로 볼지는
+    // 정책이다. address(0) 만 막는다 — 그건 ERC20 이 반드시 거부하므로
+    // 그 리프는 어떤 경우에도 지급될 수 없다.
+
+    // H-7. JSON 숫자형 totalAmount 는 String() 을 거치며 이미 IEEE754 로
+    // 뭉개진 값이 되고, 그 뒤의 /^\d+$/ 검사와 총합 검사를 전부 통과한다.
+    // 감사 7차 재현: 2123953952678305934 -> 2123953952678306000 (+66 wei).
+    const mNum = thrown([{ account: A(1), category: 'flat', totalAmount: 2123953952678305934 }]);
+    ok(mNum !== null, '따옴표 없는 JSON 숫자 totalAmount 가 거부된다');
+    ok(mNum !== null && /string|문자열|quote/i.test(mNum), '그리고 메시지가 문자열로 쓰라고 말한다');
+
+    // 안전한 구간이라도 거부한다. 통과시키면 "작은 값은 괜찮다" 를 배우게 되고
+    // 정확히 개인 배분 금액대(1e18~1e21)에서 조용히 틀린다.
+    ok(thrown([{ account: A(1), category: 'flat', totalAmount: 1000 }]) !== null,
+      '정밀도 손실이 없는 작은 숫자도 거부된다 — 예외를 두지 않는다');
+    ok(thrown([{ account: A(1), category: 'flat', totalAmount: (1n * E).toString() }]) === null,
+      '문자열이면 그대로 통과한다');
+
+    // M-8. bucket.* 는 검증되지 않아 오타 하나가 check 6 을 통째로 무력화한다.
+    const badBucket = { ...POLICY, bucket: { ...POLICY.bucket, tgeBps: 99999 } };
+    ok(thrown(ROWS, badBucket) !== null, 'bucket.tgeBps 가 10000 을 넘으면 거부된다');
+    const negMonths = { ...POLICY, bucket: { ...POLICY.bucket, linearMonths: -1 } };
+    ok(thrown(ROWS, negMonths) !== null, 'bucket.linearMonths 가 음수면 거부된다');
+    const badTotal = { ...POLICY, bucket: { ...POLICY.bucket, total: 'abc' } };
+    const mBadTotal = thrown(ROWS, badTotal);
+    ok(mBadTotal !== null && !/Cannot convert/.test(mBadTotal),
+      'bucket.total 이 숫자가 아니면 BigInt 가 죽기 전에 이름을 대고 거부된다');
+  }
+
   console.log(`\n${pass} passed, ${fail} failed\n`);
   process.exit(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error(e); process.exit(1); });
