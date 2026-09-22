@@ -3,6 +3,7 @@
 //
 //   RPC_URL=... CHAIN_ID=97 DEPLOYER_KEY=0x... \
 //   HCOW_ADDRESS=0x... CLAIM_OWNER=0x<treasury Safe> CLAIM_DEADLINE=<unix seconds> \
+//   TGE_TIME=<unix seconds> CLAIM_NOTICE_SECONDS=259200 CLAIM_WINDOW_SECONDS=7776000 \
 //   node scripts/deploy-claim.cjs
 //
 //   DRY_RUN=yes   runs every check below and deploys nothing.
@@ -167,10 +168,28 @@ async function main() {
   // drafted. A deadline before that would close claiming on rounds that have
   // not opened. The deadline extends but never shortens, so erring long costs
   // nothing and erring short cannot be undone.
-  const tge = record.tgeTime;
+  // 7차 감사 M-4. 이 대조는 record.tgeTime 에만 의존했고, 그 값을 쓰는 곳은
+  // 저장소 전체에서 deploy.cjs 하나뿐이다. 정해진 배포 순서는
+  // token -> HCOWClaim -> vesting 이므로 이 스크립트가 도는 시점에 tgeTime 은
+  // 구조적으로 항상 없었다. 즉 "no TGE recorded" 가 예외가 아니라 상시였고,
+  // claimDeadline 은 연장만 되고 줄일 수 없으므로 "너무 짧게 잡았다" 를 잡아
+  // 줄 유일한 검사가 한 번도 돌지 않았다. 대표 결정으로 env 로 직접 받는다.
+  const envTge = process.env.TGE_TIME;
+  if (envTge !== undefined && !/^\d+$/.test(String(envTge).trim())) {
+    throw new Error(`TGE_TIME "${envTge}" must be a unix timestamp in SECONDS, not milliseconds and not a date string.`);
+  }
+  const tgeFromEnv = envTge === undefined ? null : Number(String(envTge).trim());
+  // 둘 다 있으면 일치해야 한다. 이 스크립트가 고르지 않는다.
+  if (tgeFromEnv !== null && record.tgeTime && Number(record.tgeTime) !== tgeFromEnv) {
+    throw new Error(
+      `TGE_TIME is ${tgeFromEnv} but deployments/${chainId}.json records tgeTime as ${record.tgeTime}. ` +
+      'One of the two is wrong and this script will not pick. The vesting contract fixes tgeTime as ' +
+      'immutable, so the recorded value is what the chain will hold.');
+  }
+  const tge = tgeFromEnv ?? (record.tgeTime ? Number(record.tgeTime) : null);
   if (tge) {
     const monthsAfterTge = (deadline - tge) / (30 * DAY);
-    console.log(`          ${monthsAfterTge.toFixed(1)} thirty-day months after the recorded TGE`);
+    console.log(`          ${monthsAfterTge.toFixed(1)} thirty-day months after TGE ${tgeFromEnv !== null ? '(TGE_TIME)' : '(recorded)'}`);
     if (deadline <= tge) throw new Error('CLAIM_DEADLINE is at or before TGE; no round would ever be claimable');
     if (mainnet && monthsAfterTge < 12) {
       throw new Error(
@@ -178,8 +197,15 @@ async function main() {
         'opens at month 4, and a deadline this close reads as a countdown. It extends later but never ' +
         'shortens, so set it long and extend if you need to.');
     }
+  } else if (mainnet && !dryRun) {
+    throw new Error(
+      'TGE_TIME must be set, in unix SECONDS, or deployments/<chain>.json must already record tgeTime. ' +
+      'CLAIM_DEADLINE can only ever be extended, so the comparison against TGE is the one check that ' +
+      'can catch a deadline set too short, and on mainnet it is not optional. In the deployment order ' +
+      'this repository uses, the claim contract is deployed before vesting exists, so the record does ' +
+      'not have tgeTime yet and the value has to come from here.');
   } else {
-    console.log('          no TGE recorded for this chain; the deadline is not being compared to it');
+    console.log('          no TGE given and none recorded; the deadline is not being compared to it');
   }
 
   // ---- the notice period ------------------------------------------------

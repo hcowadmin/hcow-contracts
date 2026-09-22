@@ -197,7 +197,8 @@ async function main() {
   console.log('\n4. the floor, at its own boundary and at the round boundary  (kills M05, M06, M13)\n');
   {
     // A fresh contract: the raise window shuts the moment the earliest round
-    // opens, and rounds have been open on `claim` since case 1.
+    // is REGISTERED (audit 7, H-2), and rounds have been registered on `claim`
+    // since case 1.
     const FLOOR = 5n * E;
     const c2 = await deployC('HCOWClaim', ci, [token.toString(), A(0), now + 400n * DAY, NOTICE, WINDOW]);
     await send({ to: token, data: ti.encodeFunctionData('transfer', [c2.toString(), 1000n * E]) });
@@ -209,16 +210,20 @@ async function main() {
     const t = twoLeaf(5n, { index: 0n, account: A(1), amount: FLOOR }, { index: 1n, account: A(2), amount: FLOOR - 1n });
     await send({ to: c2, data: ci.encodeFunctionData('setRoot', [5n, t.root, OPENS]) });
 
-    // Registering the round is not the same instant as opening it, and the
-    // gate is the OPENING. One second before, a raise is still allowed.
+    // 이 자리에는 원래 정반대의 단언이 있었다:
+    //   "one second before the round opens, a raise is still allowed"
+    // 게이트가 개시 시점이었기 때문에 그게 사실이었고, 이 테스트는 그 동작을
+    // 정상으로 못박고 있었다. 7차 감사가 그 간격에서 고지 0초로 확정된 리프를
+    // 배제할 수 있음을 재현했고, 대표 결정으로 게이트를 등록 시점으로 옮겼다.
+    // 테스트가 결함을 정답으로 고정하고 있던 사례라 그대로 남겨둘 수 없었다.
     now = OPENS - 1n;
-    const stillOpen = await send({ to: c2, data: ci.encodeFunctionData('setMinClaimAmount', [FLOOR + 1n]) });
-    ok(!stillOpen.execResult.exceptionError, 'one second before the round opens, a raise is still allowed');
-    await send({ to: c2, data: ci.encodeFunctionData('setMinClaimAmount', [FLOOR]) });
+    const shutAlready = await send({ to: c2, data: ci.encodeFunctionData('setMinClaimAmount', [FLOOR + 1n]) });
+    eq(errName(ci, shutAlready), 'MinClaimAmountRaiseClosed',
+      'one second before the round opens, the raise window is ALREADY shut — it shut at registration');
 
     now = OPENS;   // the exact boundary
     const atBoundary = await send({ to: c2, data: ci.encodeFunctionData('setMinClaimAmount', [FLOOR + 1n]) });
-    eq(errName(ci, atBoundary), 'MinClaimAmountRaiseClosed', 'in the block it opens, the raise window is already shut');
+    eq(errName(ci, atBoundary), 'MinClaimAmountRaiseClosed', 'and it is still shut in the block it opens');
 
     const exact = await send({ to: c2, data: ci.encodeFunctionData('claim', [5n, 0n, A(1), FLOOR, t.proofs[0]]) });
     ok(!exact.execResult.exceptionError, 'an amount EQUAL to the floor is allowed, not refused');
@@ -506,6 +511,64 @@ async function main() {
     const paid = await send({ to: c12, data: ci.encodeFunctionData('claim', [1n, 0n, A(1), 100n * E, t12.p ? t12.p[0] : t12.proofs[0]]) });
     ok(!paid.execResult.exceptionError, '예정대로 개시일에 A1 이 청구한다');
     now -= 60n * DAY;
+  }
+
+
+  // ------------------ 바닥값 인상은 첫 setRoot 에서 닫힌다 (7차 H-2, 대표 결정 (a))
+  console.log('\n12. minClaimAmount 인상은 첫 회차가 등록되는 순간 닫힌다  (7차 H-2)\n');
+  {
+    // 이전 게이트는 "첫 회차가 열리는 순간" 이었다. 명단과 금액이 확정·공개되는
+    // 시점은 등록(setRoot)이고 개시는 그보다 minRoundNotice 뒤다. 그 사이에
+    // owner 는 고지 0초로 바닥값을 올려 이미 커밋된 리프를 배제할 수 있었다.
+    // 같은 효과를 루트 재작성으로 내려면 고지가 강제되는데 이쪽만 아니었다.
+    // 7차 감사에서 재현했고 대표 결정으로 게이트를 등록 시점으로 당겼다.
+    const NOTICE3 = 30n * DAY, W3 = 3600n, D3 = now + 400n * DAY;
+    const c12 = await deployC('HCOWClaim', ci, [token.toString(), A(0), D3, NOTICE3, W3]);
+    await send({ to: token, data: ti.encodeFunctionData('transfer', [c12.toString(), 2000n * E]) });
+
+    // 등록 전에는 자유롭게 올릴 수 있다. 그게 이 파라미터의 쓰임이다.
+    const up1 = await send({ to: c12, data: ci.encodeFunctionData('setMinClaimAmount', [3n * E]) });
+    ok(!up1.execResult.exceptionError, '회차가 하나도 등록되기 전에는 인상이 허용된다');
+    eq(await read(ci, c12, 'minClaimAmount', []), 3n * E, '그리고 반영된다');
+
+    const OPEN = now + NOTICE3;
+    const t12 = twoLeaf(1n, { index: 0n, account: A(1), amount: 5n * E }, { index: 1n, account: A(2), amount: 900n * E });
+    const reg = await send({ to: c12, data: ci.encodeFunctionData('setRoot', [1n, t12.root, OPEN]) });
+    ok(!reg.execResult.exceptionError, '회차를 등록한다 — 이 순간 명단과 금액이 확정된다');
+
+    // 여기가 바뀐 부분. 개시까지 30일이 남았지만 인상은 이미 닫혔다.
+    const raise = await send({ to: c12, data: ci.encodeFunctionData('setMinClaimAmount', [100n * E]) });
+    eq(errName(ci, raise), 'MinClaimAmountRaiseClosed',
+      '등록 직후, 개시 30일 전인데도 인상이 거부된다  (kills 게이트를 개시 시점으로 되돌리기)');
+    eq(await read(ci, c12, 'minClaimAmount', []), 3n * E, '그리고 값이 바뀌지 않았다');
+
+    // 1 wei 인상도 인상이다.
+    const tiny = await send({ to: c12, data: ci.encodeFunctionData('setMinClaimAmount', [3n * E + 1n]) });
+    eq(errName(ci, tiny), 'MinClaimAmountRaiseClosed', '1 wei 인상도 거부된다  (kills > vs >=)');
+
+    // 같은 값으로 다시 쓰는 것은 인상이 아니다. 거부하지 않는다.
+    const same = await send({ to: c12, data: ci.encodeFunctionData('setMinClaimAmount', [3n * E]) });
+    ok(!same.execResult.exceptionError, '같은 값 재설정은 인상이 아니므로 허용된다');
+
+    // 인하는 언제나 열려 있다. 더 많은 사람이 받게 되는 방향이다.
+    const down = await send({ to: c12, data: ci.encodeFunctionData('setMinClaimAmount', [E]) });
+    ok(!down.execResult.exceptionError, '인하는 등록 뒤에도 허용된다');
+    eq(await read(ci, c12, 'minClaimAmount', []), E, '그리고 반영된다');
+
+    // 그래서 7차 H-2 의 공격이 성립하지 않는다.
+    now = OPEN;
+    const before12 = await bal(A(1));   // A(1) 은 앞선 절에서도 받았다. 증분으로 잰다.
+    const paid = await send({ to: c12, data: ci.encodeFunctionData('claim', [1n, 0n, A(1), 5n * E, t12.proofs[0]]) });
+    ok(!paid.execResult.exceptionError, '약속된 5 HCOW 수취인이 개시일에 실제로 받는다');
+    eq(await bal(A(1)) - before12, 5n * E, '그리고 잔고가 정확히 5 HCOW 늘었다');
+
+    // 개시 뒤에도 인하는 계속 열려 있다. 기한이 지난 뒤에도 그렇다.
+    const down2 = await send({ to: c12, data: ci.encodeFunctionData('setMinClaimAmount', [0n]) });
+    ok(!down2.execResult.exceptionError, '개시 뒤에도 인하는 허용된다');
+    now = D3 + DAY;
+    const down3 = await send({ to: c12, data: ci.encodeFunctionData('setMinClaimAmount', [0n]) });
+    ok(!down3.execResult.exceptionError, '기한이 지난 뒤에도 인하는 허용된다');
+    now = 1900000000n;
   }
 
   console.log(`\n${pass} passed, ${fail} failed\n`);

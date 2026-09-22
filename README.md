@@ -400,10 +400,44 @@ one contract serves every unlock round of every airdrop category.
 | One claim per round per entry | Per-round bitmap. Rounds share nothing, so a claimed round 0 does not close round 1 |
 | A failed transfer never marks an entry claimed | The balance is checked first and the entry is marked before the transfer, so an underfunded round reverts whole with `InsufficientBalance` and the bit is rolled back with it. This is the standard permanent-loss bug in multi-round distributors, and test 9 is the one that proves it is absent |
 | `sweep` is shut until `claimDeadline`, with no override | But it is **not** the owner's only route to the tokens, and this table used to say it was. `setRoot` is the second route: the owner can register an unused round whose tree pays one address the balance, wait out `minRoundNotice`, and claim it. That is a property of every distributor whose operator chooses the root, and design note 4 in the contract sets out what is enforced instead. Do not read this row as more than it says |
-| The deadline extends, never shortens | `extendDeadline` refuses anything at or below the current value. A shortenable deadline is confiscation on notice |
-| `minClaimAmount` is raised only before the first round opens | Afterwards it moves down and never up, reverting with `MinClaimAmountRaiseClosed`. A floor raised over a live distribution excludes exactly the small recipients the floor exists to spare gas, which is shortening the deadline reached by another route |
+| The deadline extends, never shortens, and not past the horizon | `extendDeadline` refuses anything at or below the current value, and anything more than `MAX_DEADLINE_HORIZON` from the calling block. Unbounded, it could be pushed out of reach and — since `setRoot`'s upper bound is derived from it — take a registered round with it, leaving the balance neither claimable nor sweepable (audit 7) |
+| `minClaimAmount` is raised only before the first round is **registered** | Afterwards it moves down and never up, reverting with `MinClaimAmountRaiseClosed`. The gate used to be the first round *opening*, which left the whole `minRoundNotice` interval — after the list is fixed and published, before anyone can claim — open to a zero-notice raise that excluded committed leaves. Audit 7 reproduced it and the gate moved back to registration |
 | Ownership cannot be renounced | Renouncing would end `setRoot` too, so no later round could ever open and everything still owed would be stranded |
 | No unlock policy is in the contract | It knows only "may this address take this amount in this round". Ratios live in the tree |
+
+### What it does NOT guarantee
+
+Stated here because the table above is the kind of thing people quote, and
+because two of this project's published promises did not survive an
+adversarial read (audit 7, 2026-09-22).
+
+**The owner can rewrite the recipient list of a round that has not opened yet,
+and can register a round that pays the owner.** `setRoot` is a second route to
+the balance and `sweep` is not the only one. Every distributor whose operator
+chooses the root works this way: the contract cannot tell an honest recipient
+list from a dishonest one, because both arrive as a `setRoot`. Design note 4 in
+the contract states this in full rather than defending against it.
+
+What actually constrains that power is two things, and they are not in the
+contract: **the owner is a 2-of-3 multisig, and every root ever written emits a
+public `RoundSet` event before it can pay anyone.** `minRoundNotice` is what
+makes "before" true.
+
+What the contract does enforce, and all of it:
+
+```
+1  sweep() reverts before claimDeadline, with no override
+2  claimDeadline extends and never shortens, and an extension cannot
+   reach further than MAX_DEADLINE_HORIZON from the calling block
+3  an opened round's root is frozen forever, including against a call
+   that would set the identical root
+4  minClaimAmount is raised only before the first round is REGISTERED,
+   and lowered at any time thereafter
+5  ownership cannot be renounced and transfer is two-step
+```
+
+Anyone relying on a stronger guarantee than that list is relying on something
+this contract does not provide.
 
 `owner` is the treasury Safe, passed at deployment. `minClaimAmount` starts at
 zero, meaning no floor, and is the parameter left for spec section 10 item 2.

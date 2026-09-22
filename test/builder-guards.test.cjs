@@ -277,6 +277,89 @@ function build(tamper) {
       'bucket.total 이 숫자가 아니면 BigInt 가 죽기 전에 이름을 대고 거부된다');
   }
 
+
+  // ------------------------- 바닥값 대조와 공표 총액 대조 (7차 M-1 / M-2)
+  console.log('\n트리는 바닥값과 공표 총액을 스스로 대조한다  (7차 M-1 · M-2)\n');
+  {
+    const { buildDistribution } = loadBuilder(null);
+    const thrown = (rows, policy, opts = { tgeTime: TGE }) => {
+      try { buildDistribution(rows, policy, opts); return null; }
+      catch (e) { return e.message; }
+    };
+    // ROWS 의 총합. split3 은 33% TGE + 2회 분할이라 첫 회차 리프가 작아진다.
+    const TOTAL_IN = 1n * E + 900000n * E + 5n * E;
+
+    // ---- M-1. minClaimAmount 보다 작은 리프가 있으면 중단한다 ----------
+    //
+    // 7차 감사 실측: 실입력 1,205명 빌드의 round 0 에 1 HCOW 미만 리프가 229개,
+    // 합 192.19 HCOW 있었다. 컨트랙트의 바닥값이 그보다 높으면 그 229개는
+    // 루트가 동결되는 순간 영구 청구 불가다. 빌더도 set-root 도 minClaimAmount
+    // 라는 단어를 아예 몰랐다 (양쪽 grep 0건).
+    const noFloor = { ...POLICY, minClaimAmount: '0' };
+    ok(thrown(ROWS, noFloor) === null, '바닥값 0 이면 지금까지처럼 통과한다');
+
+    // A(1) 은 1 HCOW 를 33% / 나머지 2회로 쪼갠다. 첫 회차 리프가 0.33 HCOW.
+    const floorHigh = { ...POLICY, minClaimAmount: (1n * E).toString() };
+    const mFloor = thrown(ROWS, floorHigh);
+    ok(mFloor !== null, '바닥값보다 작은 리프가 있으면 중단한다');
+    ok(mFloor !== null && /minClaimAmount|바닥값|floor/i.test(mFloor), '메시지가 바닥값을 지목한다');
+    ok(mFloor !== null && /\d/.test(mFloor), '그리고 몇 개인지 또는 가장 작은 값이 무엇인지 말한다');
+
+    const floorOk = { ...POLICY, minClaimAmount: '1000' };
+    ok(thrown(ROWS, floorOk) === null, '모든 리프가 바닥값 이상이면 통과한다');
+
+    // 바닥값 자체가 형태부터 틀리면 BigInt 가 죽기 전에 잡는다.
+    const floorBad = { ...POLICY, minClaimAmount: '1.5' };
+    const mBad = thrown(ROWS, floorBad);
+    ok(mBad !== null && !/Cannot convert/.test(mBad), '바닥값이 정수 wei 가 아니면 이름을 대고 거부한다');
+
+    // ---- M-2. 공표 총액과 정확히 일치해야 한다 ------------------------
+    //
+    // 7차 감사 실측: floor / round-half / ceil 로 계산한 세 입력이 전부 오류
+    // 없이 빌드됐고 셋 다 "grand total exact" 를 출력했다. 유일한 상한이
+    // policy.bucket.total = 8,000,000 HCOW 라 실제 배포의 85배였다.
+    ok(thrown(ROWS, POLICY, { tgeTime: TGE, expectTotal: TOTAL_IN.toString() }) === null,
+      '공표 총액이 정확히 맞으면 통과한다');
+    for (const delta of [1n, -1n, 1000n]) {
+      const m = thrown(ROWS, POLICY, { tgeTime: TGE, expectTotal: (TOTAL_IN + delta).toString() });
+      ok(m !== null, `공표 총액이 ${delta > 0n ? '+' : ''}${delta} wei 어긋나면 중단한다`);
+      ok(m !== null && /expect|공표|총액|total/i.test(m), '  그리고 메시지가 두 숫자를 다 보여준다');
+    }
+    const mShape = thrown(ROWS, POLICY, { tgeTime: TGE, expectTotal: '95337.92' });
+    ok(mShape !== null && !/Cannot convert/.test(mShape),
+      '공표 총액이 정수 wei 가 아니면 (소수점 HCOW 를 그대로 넣으면) 이름을 대고 거부한다');
+  }
+
+  console.log('\nCLI 는 --expect-total 없이는 돌지 않는다  (7차 M-2)\n');
+  {
+    const { spawnSync } = require('child_process');
+    const fs = require('fs'), os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bmcli-'));
+    const rowsFile = path.join(dir, 'rows.json');
+    fs.writeFileSync(rowsFile, JSON.stringify(ROWS, null, 2));
+    const polFile = path.join(dir, 'policy.json');
+    fs.writeFileSync(polFile, JSON.stringify({ ...POLICY, minClaimAmount: '0' }, null, 2));
+    const TOTAL_IN = (1n * E + 900000n * E + 5n * E).toString();
+    const cli = (extra = []) => spawnSync(process.execPath,
+      [path.join(__dirname, '..', 'scripts', 'build-merkle.cjs'), rowsFile,
+       '--policy', polFile, '--tge', String(TGE), '--out', path.join(dir, 'out'), ...extra],
+      { cwd: path.join(__dirname, '..'), encoding: 'utf8' });
+
+    const missing = cli();
+    ok(missing.status !== 0, '--expect-total 이 없으면 exit 0 이 아니다');
+    ok(/expect-total/.test(missing.stdout + missing.stderr), '그리고 그 이름을 말한다');
+    ok(!fs.existsSync(path.join(dir, 'out')), '그리고 아무것도 쓰지 않았다');
+
+    const wrong = cli(['--expect-total', '1']);
+    ok(wrong.status !== 0, '--expect-total 이 틀리면 중단한다');
+    ok(!fs.existsSync(path.join(dir, 'out')), '그리고 여전히 아무것도 쓰지 않았다');
+
+    const right = cli(['--expect-total', TOTAL_IN]);
+    ok(right.status === 0, '--expect-total 이 맞으면 빌드된다');
+    ok(fs.existsSync(path.join(dir, 'out', 'rounds.json')), '그리고 rounds.json 이 나온다');
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
   console.log(`\n${pass} passed, ${fail} failed\n`);
   process.exit(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -113,11 +113,23 @@ claimMany(roundId[], index[], account[], amount[], merkleProof[][])   // 여러 
 ```
 
 - proof가 유효하지 않으면 revert
-- 이미 청구한 (roundId, account) 조합이면 revert
+- 이미 청구한 **(roundId, index)** 조합이면 revert
+  - **정정 (감사 7차, 2026-09-22).** 이 줄은 원래 `(roundId, account)` 라고 적혀 있었고
+    구현은 그렇지 않다. 비트맵 키는 `(roundId, index)` 이며 `account` 는 들어가지 않는다.
+    Uniswap MerkleDistributor 원본과 같은 보장이다. **한 회차에 같은 주소가 두 개의
+    index 로 들어가면 두 번 지급된다.** 실제 방어선은 `build-merkle.cjs` 가 중복 주소를
+    거부하는 것이다. 컨트랙트에 계정 단위 가드를 넣지 않기로 한 이유는 "표준 구현을
+    최대한 그대로 쓴다" 이며, 대신 이 문장을 사실에 맞춘다
 - 회차가 아직 열리지 않았으면 revert
 - 컨트랙트 잔액이 부족하면 **claimed를 남기지 않고 전체 revert**
 
 ### 4-3. 최소 청구 수량
+
+**인상 창은 첫 회차가 "등록" 되는 순간 닫힌다 (감사 7차 H-2, 대표 결정 2026-09-22).**
+원래 사양과 초기 구현은 "첫 회차가 **개시**되기 전" 이었다. 명단과 금액은 `setRoot` 에서
+확정·공개되고 개시는 `minRoundNotice` 뒤이므로, 그 사이에 운영자가 **고지 0초로** 바닥값을
+올려 이미 커밋된 리프를 배제할 수 있었다. 같은 배제를 루트 재작성으로 내려면 고지가
+강제되는데 이쪽만 아니었다. 인하는 언제나 열려 있다.
 
 ```
 minClaimAmount   (설정값, 초기값 미정)
@@ -165,13 +177,33 @@ RoundSet(roundId, merkleRoot, startTime)
 Claimed(roundId, index, account, amount)
 Swept(to, amount)
 DeadlineExtended(oldDeadline, newDeadline)
+MinClaimAmountSet(oldAmount, newAmount)      // 감사 7차에서 목록에 추가
 ```
 
 ### 4-7. 권한
 
-- `setRoot`, `sweep`, `extendDeadline`은 owner 전용
+- `setRoot`, `sweep`, `extendDeadline`, `setMinClaimAmount` 는 owner 전용
 - **owner는 멀티시그(Safe) 주소가 된다.** 배포 시 인자로 받는다
-- owner가 토큰을 임의로 빼갈 수 있는 경로는 `sweep` 하나뿐이어야 하고, 기한 제약이 걸려야 한다
+- ~~owner가 토큰을 임의로 빼갈 수 있는 경로는 `sweep` 하나뿐이어야 하고, 기한 제약이 걸려야 한다~~
+
+  **이 요구는 구현되지 않았고, 이 설계로는 구현할 수 없다 (감사 7차, 2026-09-22).**
+  `setRoot` 가 두 번째 경로다. owner 는 쓰지 않은 roundId 에 자기 주소 한 건짜리 트리를
+  등록하고 `minRoundNotice` 를 기다린 뒤 청구할 수 있다. 명단을 운영자가 고르는 머클
+  배포는 전부 그렇다 — 컨트랙트는 정직한 명단과 그렇지 않은 명단을 구별할 수 없다.
+
+  컨트랙트가 **실제로** 보장하는 것은 다음 다섯 가지다. 대외 문구는 이 목록으로 쓴다.
+
+  ```
+  1  sweep() 은 claimDeadline 전에 무조건 revert 한다. 우회 경로가 없다
+  2  claimDeadline 은 연장만 되고 단축되지 않는다.
+     연장도 MAX_DEADLINE_HORIZON(3650일) 안에서만 (감사 7차 H-1)
+  3  열린 회차의 루트는 영구 동결된다. 같은 값으로 다시 쓰는 것도 거부된다
+  4  minClaimAmount 는 첫 회차가 등록되기 전에만 올릴 수 있고, 이후로는 내리기만 된다
+  5  소유권은 포기 불가, 이전은 2단계. 모든 루트 등록이 RoundSet 이벤트를 남긴다
+  ```
+
+  이 권한을 실제로 제약하는 것은 **owner 가 2-of-3 멀티시그라는 점과 모든 등록이 체인에
+  공개 기록으로 남는다는 점**이다. 그 이상을 주장하지 않는다
 
 ---
 
@@ -188,7 +220,13 @@ OpenZeppelin  5.0.2
 체인          BNB Chain (chain id 56), 테스트넷 97
 ```
 
-이 설정은 `hardhat.config.cjs`, `foundry.toml`, `compile.cjs` 네 곳에 동일하게 있어야 한다.
+이 설정은 `foundry.toml`, `compile.cjs`, 그리고 `hcow-protocol` 의 `foundry.toml`
+**세 곳**에 동일하게 있어야 한다.
+
+**정정 (감사 7차).** 원래 "`hardhat.config.cjs`, `foundry.toml`, `compile.cjs` 네 곳" 이라고
+적혀 있었는데, 셋만 나열했고 그중 `hardhat.config.cjs` 는 이 저장소에 **존재하지 않는다**
+(`scripts/_connect.cjs:2` 가 "This repository has no hardhat" 라고 적고 있다).
+`CLAUDE.md` 의 같은 문장도 함께 고쳐야 한다.
 
 ### 코드 구조
 

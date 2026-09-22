@@ -77,10 +77,12 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *         yet. See note 8.
  *       - no round opens in the block it was registered: minRoundNotice.
  *       - an opened round's root is frozen forever.
- *       - minClaimAmount is raised only before the first round opens, and
- *         lowered at any time. A floor raised over a live distribution
- *         excludes the smallest recipients, which is confiscation on notice
- *         wearing a different hat.
+ *       - minClaimAmount is raised only before the first round is REGISTERED,
+ *         and lowered at any time. An earlier version gated the raise on the
+ *         first round OPENING, which left the whole minRoundNotice interval --
+ *         after the list is fixed and published, before anyone can claim --
+ *         open to a zero-notice raise that excluded committed leaves. Audit 7
+ *         reproduced it and the gate was moved back to registration.
  *       - ownership cannot be renounced, and transfer is two-step.
  *       - every root the owner writes emits RoundSet.
  *
@@ -258,8 +260,10 @@ contract HCOWClaim is Ownable2Step, ReentrancyGuard {
     error InsufficientBalance(uint256 required, uint256 held);
     error DeadlineNotReached(uint256 deadline);
     error DeadlineNotExtended(uint256 current, uint256 proposed);
-    /// @notice Raising the floor closed when the first round opened. Lowering
-    ///         it is still available.
+    /// @notice Raising the floor closed when the first round was REGISTERED.
+    ///         The value reported is that round's scheduled opening, which is
+    ///         the only timestamp this contract keeps for it. Lowering the
+    ///         floor is still available, and always will be.
     error MinClaimAmountRaiseClosed(uint256 since);
     error LengthMismatch();
     error EmptyBatch();
@@ -467,9 +471,23 @@ contract HCOWClaim is Ownable2Step, ReentrancyGuard {
      */
     function setMinClaimAmount(uint256 newMinClaimAmount) external onlyOwner {
         uint256 old = minClaimAmount;
-        uint256 opensAt = earliestRoundStart;
-        if (newMinClaimAmount > old && block.timestamp >= opensAt) {
-            revert MinClaimAmountRaiseClosed(opensAt);
+        uint256 firstRound = earliestRoundStart;
+        // The window closes when the FIRST ROUND IS REGISTERED, not when it
+        // opens. Audit 7 (2026-09-22) reproduced why: a round's recipients and
+        // amounts are fixed and published by setRoot, and the round opens
+        // minRoundNotice later. The old gate left that whole interval open, so
+        // the owner could raise the floor with zero notice and exclude leaves
+        // that were already committed; the round then opened, froze, and the
+        // excluded balance went out through sweep at the deadline.
+        //
+        // The asymmetry was the tell. Producing the same exclusion by rewriting
+        // the root is refused with NoticeTooShort right up to the opening, so
+        // one route to a given outcome was time-locked and the other was not.
+        //
+        // Lowering stays open forever, including after claimDeadline, because
+        // lowering can only ever let more people claim.
+        if (newMinClaimAmount > old && firstRound != type(uint256).max) {
+            revert MinClaimAmountRaiseClosed(firstRound);
         }
         minClaimAmount = newMinClaimAmount;
         emit MinClaimAmountSet(old, newMinClaimAmount);

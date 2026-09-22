@@ -110,8 +110,15 @@ const env = (s) => ({
     ok(!hasRec(56), 'no deployments record exists');
     const r = await run('deploy-claim.cjs', env(s));
     says(r, 'FIRST_DEPLOY', 'it refuses and names the flag');
-    const y = await run('deploy-claim.cjs', { ...env(s), FIRST_DEPLOY: 'yes' });
-    ok(y.status === 0, 'FIRST_DEPLOY=yes proceeds');
+    // 7차 M-4 이후: 레코드가 없으면 tgeTime 도 없으므로 메인넷에서는 TGE_TIME
+    // 을 함께 줘야 한다. 그것이 이 조치의 요점이다 — 정해진 배포 순서에서는
+    // 레코드에 tgeTime 이 있을 수가 없고, 그래서 TGE 대조가 한 번도 돌지 않았다.
+    // 먼저 TGE 없이. 성공한 실행이 레코드를 만들면 그 다음 실행은 재실행
+    // 가드에 먼저 걸려서 이 케이스가 엉뚱한 이유로 통과한다.
+    const noTge = await run('deploy-claim.cjs', { ...env(s), FIRST_DEPLOY: 'yes' });
+    says(noTge, 'TGE_TIME', 'FIRST_DEPLOY 만으로는 부족하다 — TGE 를 알 방법이 없으면 거부된다');
+    const y = await run('deploy-claim.cjs', { ...env(s), FIRST_DEPLOY: 'yes', TGE_TIME: String(NOW + 30 * DAY) });
+    ok(y.status === 0, 'FIRST_DEPLOY=yes + TGE_TIME 이면 진행된다');
   }
 
   console.log('\ndeploy-claim.cjs — token identity (audit 4, C-4)\n');
@@ -574,6 +581,60 @@ const env = (s) => ({
     const live = await run('anchor.cjs', aenv({}));
     ok(live.status === 0 && await count() === 1n, '플래그가 없으면 실제로 앵커한다');
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+
+  // ======================================================================
+  // deploy-claim.cjs 의 TGE 대조는 한 번도 실행되지 않았다 (7차 M-4)
+  //
+  // record.tgeTime 을 쓰는 곳은 저장소 전체에서 deploy.cjs 하나뿐이고,
+  // 정해진 배포 순서는 token → HCOWClaim → vesting 이라 deploy-claim 이 도는
+  // 시점에 tgeTime 은 구조적으로 항상 없다. deploy-token.cjs 는 그 값을
+  // 기록하지 않는다. claimDeadline 은 연장만 되고 줄일 수 없으므로 "너무
+  // 짧게 잡았다" 를 잡아 줄 유일한 검사가 죽어 있었다.
+  // 대표 결정: TGE_TIME 을 env 로 직접 받는다.
+  // ======================================================================
+  console.log('\ndeploy-claim.cjs — TGE 대조가 실제로 돈다 (7차 M-4)\n');
+  {
+    clearRec();
+    const s = await stage();
+    // 레코드에 tgeTime 이 없는 상태. 정해진 순서에서는 이게 정상이다.
+    writeRec(56, { chainId: 56, treasury: s.treasury, addresses: { HCOWToken: s.token } });
+    const base = { ...env(s) };
+    delete base.CLAIM_DEADLINE;
+    const e = (extra) => ({ ...base, CLAIM_DEADLINE: String(NOW + 800 * DAY), ...extra });
+
+    const none = await run('deploy-claim.cjs', e({}));
+    says(none, 'TGE_TIME', '메인넷에서 TGE 를 알 방법이 없으면 거부하고 그 이름을 말한다');
+    ok(!readRec(56).addresses?.HCOWClaim, '그리고 아무것도 배포하지 않았다');
+
+    const tge = NOW + 30 * DAY;
+    const okRun = await run('deploy-claim.cjs', e({ TGE_TIME: String(tge) }));
+    ok(okRun.status === 0, 'TGE_TIME 을 주면 배포된다');
+    ok(/months after/.test(okRun.out), '그리고 TGE 대비 개월 수를 실제로 출력한다 — 검사가 돌았다는 뜻');
+
+    // 이제 검사가 실제로 무언가를 잡는지 본다.
+    clearRec();
+    const s2 = await stage();
+    writeRec(56, { chainId: 56, treasury: s2.treasury, addresses: { HCOWToken: s2.token } });
+    const e2 = (extra) => ({ ...env(s2), ...extra });
+    const short = await run('deploy-claim.cjs', {
+      ...e2({ TGE_TIME: String(NOW + 30 * DAY) }), CLAIM_DEADLINE: String(NOW + 60 * DAY) });
+    says(short, 'months after TGE', '기한이 TGE 로부터 1개월이면 메인넷에서 거부된다');
+    const before = await run('deploy-claim.cjs', {
+      ...e2({ TGE_TIME: String(NOW + 900 * DAY) }), CLAIM_DEADLINE: String(NOW + 800 * DAY) });
+    says(before, 'at or before TGE', '기한이 TGE 보다 앞서면 거부된다');
+    ok(!readRec(56).addresses?.HCOWClaim, '두 경우 모두 아무것도 배포되지 않았다');
+
+    // 레코드와 env 가 둘 다 있으면 일치해야 한다. 고르지 않는다.
+    clearRec();
+    const s3 = await stage();
+    writeRec(56, { chainId: 56, treasury: s3.treasury, tgeTime: NOW + 30 * DAY,
+                   addresses: { HCOWToken: s3.token } });
+    const clash = await run('deploy-claim.cjs', { ...env(s3), TGE_TIME: String(NOW + 31 * DAY) });
+    says(clash, 'TGE_TIME', '레코드의 tgeTime 과 TGE_TIME 이 다르면 거부한다');
+    const agree = await run('deploy-claim.cjs', { ...env(s3), TGE_TIME: String(NOW + 30 * DAY) });
+    ok(agree.status === 0, '두 값이 같으면 배포된다');
   }
 
   clearRec();

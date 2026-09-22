@@ -182,6 +182,7 @@ async function main() {
   eq(await read(claimAbi, claim, 'claimDeadline'), DEADLINE, 'claimDeadline is what was passed at deployment');
   eq(await read(claimAbi, claim, 'minClaimAmount'), 0n, 'minClaimAmount starts at zero, meaning no floor (spec 4-3)');
 
+  let floored;   // 17 에서 만들어 18/19 가 쓴다 (7차 H-2 조치)
   const setRoot = (roundId, from = 1, over = {}) => send({
     from, to: claim,
     data: claimAbi.encodeFunctionData('setRoot', [
@@ -260,22 +261,49 @@ async function main() {
     eq(await read(claimAbi, claim, 'claimDeadline'), extended, '14 the stored deadline moved later');
   }
 
-  { // 17  회차 개시 전 minClaimAmount 인상 → 성공
+  { // 17  minClaimAmount 인상 창은 첫 회차 "등록" 에서 닫힌다
     //
-    // Every other owner power here runs one way. This one is two-way only
-    // until the first round opens, and this is that window.
+    // 사양 v0.1 은 "첫 회차가 개시되기 전" 이라고 적었고 이 테스트도 그 문장을
+    // 따라 "the floor can be raised while no round has opened" 를 단언했다.
+    // 7차 감사(2026-09-22)가 그 간격의 비용을 재현했다: 명단과 금액은 setRoot
+    // 에서 확정·공개되고 개시는 minRoundNotice 뒤다. 그 사이에 owner 는 고지
+    // 0초로 바닥값을 올려 이미 커밋된 리프를 배제할 수 있었고, 같은 효과를
+    // 루트 재작성으로 내려면 고지가 강제됐다. 대표 결정으로 게이트를 등록
+    // 시점으로 옮겼고, 이 절은 그 새 규칙을 잰다.
     eq(await read(claimAbi, claim, 'earliestRoundStart'), BigInt(R[0].startTime),
        '17 earliestRoundStart is the first registered round, not the last');
-    const r = await send({ from: 1, to: claim, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR]) });
-    ok(!r.execResult.exceptionError, '17 the floor can be raised while no round has opened');
+
+    // 이 스위트는 여기 오기 전에 이미 회차를 등록했다. 그러므로 인상은 닫혀 있다.
+    const tooLate = await send({ from: 1, to: claim, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR]) });
+    eq(errorName(claimAbi, tooLate), 'MinClaimAmountRaiseClosed',
+       '17 rounds are registered, so the raise window is already shut — before any of them opens');
+    eq(await read(claimAbi, claim, 'minClaimAmount'), 0n, '17 and the floor did not move');
+
+    // 인상이 실제로 가능한 창은 등록 전이다. 새 컨트랙트로 그것을 잰다.
+    const fresh = await deploy('HCOWClaim', claimAbi,
+      [token.toString(), treasury.toString(), DEADLINE, NOTICE, WINDOW]);
+
+    // 18/19 가 쓸 컨트랙트도 여기서 만든다. 바닥값을 등록 전에 세우고 회차를
+    // 등록해야 하는데, 두 가지 다 회차가 열리기 전에만 가능하기 때문이다.
+    // 리프는 컨트랙트 주소를 포함하지 않으므로 같은 트리와 증명을 그대로 쓴다.
+    floored = await deploy('HCOWClaim', claimAbi,
+      [token.toString(), treasury.toString(), DEADLINE, NOTICE, WINDOW]);
+    await send({ from: 1, to: token, data: tokenAbi.encodeFunctionData('transfer', [floored.toString(), 1000000n * E18]) });
+    const setFloor = await send({ from: 1, to: floored, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR]) });
+    ok(!setFloor.execResult.exceptionError, '17 a floor can be set on it before any round is registered');
+    const regF = await send({ from: 1, to: floored, data: claimAbi.encodeFunctionData('setRoot',
+      [0, R[0].merkleRoot, R[0].startTime]) });
+    ok(!regF.execResult.exceptionError, '17 and round 0 registers against it, with the floor already standing');
+    const r = await send({ from: 1, to: fresh, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR]) });
+    ok(!r.execResult.exceptionError, '17 on a contract with no round registered, the floor can be raised');
     const e = evt(claimAbi, r, 'MinClaimAmountSet');
     ok(!!e, '17 and the change emits MinClaimAmountSet');
     if (e) {
       eq(e.args[0], 0n, '17 the event carries the old floor');
       eq(e.args[1], FLOOR, '17 and the new one');
     }
-    eq(await read(claimAbi, claim, 'minClaimAmount'), FLOOR, '17 the stored floor moved up');
-    const notOwner = await send({ from: 0, to: claim, data: claimAbi.encodeFunctionData('setMinClaimAmount', [1n]) });
+    eq(await read(claimAbi, fresh, 'minClaimAmount'), FLOOR, '17 the stored floor moved up');
+    const notOwner = await send({ from: 0, to: fresh, data: claimAbi.encodeFunctionData('setMinClaimAmount', [1n]) });
     eq(errorName(claimAbi, notOwner), 'OwnableUnauthorizedAccount', '17 and only the owner may set it at all');
   }
 
@@ -294,37 +322,47 @@ async function main() {
     const c = proofFor(0, small);
     ok(BigInt(c.amount) < FLOOR, '18 there is a recipient whose round 0 entry sits under the floor');
 
-    const blocked = await send({ from: 0, to: claim, data: claimCall(0, small) });
-    eq(errorName(claimAbi, blocked), 'BelowMinimum', '18 and while the floor stands, its claim reverts with BelowMinimum');
+    // 7차 조치 이후 주 컨트랙트의 바닥값은 0 이고 다시 올릴 수 없다 — 회차가
+    // 이미 등록돼 있기 때문이다. 그래서 "바닥값이 서 있는 동안" 과 "개시 뒤
+    // 인하" 는 바닥값을 등록 전에 세워 둔 별도 컨트랙트에서 잰다. 리프는
+    // 컨트랙트 주소를 포함하지 않으므로 같은 트리와 같은 증명을 그대로 쓴다.
+    const blocked = await send({ from: 0, to: floored, data: claimCall(0, small) });
+    eq(errorName(claimAbi, blocked), 'BelowMinimum',
+       '18 and while that floor stands, the under-floor claim reverts with BelowMinimum');
+    const upF = await send({ from: 1, to: floored, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR + 1n]) });
+    eq(errorName(claimAbi, upF), 'MinClaimAmountRaiseClosed', '18 raising it there is refused too');
+
+    const downF = await send({ from: 1, to: floored, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR / 2n]) });
+    ok(!downF.execResult.exceptionError, '19 lowering it after the round opened succeeds');
+    const eF = evt(claimAbi, downF, 'MinClaimAmountSet');
+    ok(!!eF, '19 and emits MinClaimAmountSet');
+    if (eF) {
+      eq(eF.args[0], FLOOR, '19 the event carries the old floor');
+      eq(eF.args[1], FLOOR / 2n, '19 and the lower one');
+    }
+    eq(await read(claimAbi, floored, 'minClaimAmount'), FLOOR / 2n, '19 the stored floor moved down');
+    const backF = await send({ from: 1, to: floored, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR]) });
+    eq(errorName(claimAbi, backF), 'MinClaimAmountRaiseClosed',
+       '19 and it cannot be put back: down is the only direction that remains');
+    await send({ from: 1, to: floored, data: claimAbi.encodeFunctionData('setMinClaimAmount', [0n]) });
+    const paidF = await send({ from: 0, to: floored, data: claimCall(0, small) });
+    ok(!paidF.execResult.exceptionError, '19 and with the floor gone the blocked claim goes through');
+    eq(await bal(small), BigInt(c.amount), '19 paying the full entry');
 
     const up = await send({ from: 1, to: claim, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR + 1n]) });
     eq(errorName(claimAbi, up), 'MinClaimAmountRaiseClosed',
        '18 raising the floor after a round has opened reverts with MinClaimAmountRaiseClosed');
     const wayUp = await send({ from: 1, to: claim, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR * 100n]) });
     eq(errorName(claimAbi, wayUp), 'MinClaimAmountRaiseClosed', '18 by one wei or by a hundredfold, the same');
-    eq(await read(claimAbi, claim, 'minClaimAmount'), FLOOR, '18 the floor is unchanged');
+    eq(await read(claimAbi, claim, 'minClaimAmount'), 0n, '18 the floor is unchanged');
 
-    const down = await send({ from: 1, to: claim, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR / 2n]) });
-    ok(!down.execResult.exceptionError, '19 lowering the floor after a round has opened succeeds');
-    const e = evt(claimAbi, down, 'MinClaimAmountSet');
-    ok(!!e, '19 and emits MinClaimAmountSet');
-    if (e) {
-      eq(e.args[0], FLOOR, '19 the event carries the old floor');
-      eq(e.args[1], FLOOR / 2n, '19 and the lower one');
-    }
-    eq(await read(claimAbi, claim, 'minClaimAmount'), FLOOR / 2n, '19 the stored floor moved down');
-
-    const backUp = await send({ from: 1, to: claim, data: claimAbi.encodeFunctionData('setMinClaimAmount', [FLOOR] ) });
-    eq(errorName(claimAbi, backUp), 'MinClaimAmountRaiseClosed',
-       '19 and it cannot be put back: down is the only direction that remains');
-
+    // 주 컨트랙트는 바닥값이 0 이고 올릴 수 없다. 인하(0 으로) 는 여전히 통과한다.
     const toZero = await send({ from: 1, to: claim, data: claimAbi.encodeFunctionData('setMinClaimAmount', [0n]) });
-    ok(!toZero.execResult.exceptionError, '19 it can be lowered all the way to no floor at all');
+    ok(!toZero.execResult.exceptionError, '19 on the main contract, setting zero over zero is not a raise');
     eq(await read(claimAbi, claim, 'minClaimAmount'), 0n, '19 which is where the rest of this suite needs it');
 
     const paid = await send({ from: 0, to: claim, data: claimCall(0, small) });
-    ok(!paid.execResult.exceptionError, '19 and the claim the floor was blocking now goes through');
-    eq(await bal(small), BigInt(c.amount), '19 paying the full entry');
+    ok(!paid.execResult.exceptionError, '19 and the same entry claims cleanly against the main contract');
   }
 
   { // 7  이미 개시된 회차의 루트 변경 → revert

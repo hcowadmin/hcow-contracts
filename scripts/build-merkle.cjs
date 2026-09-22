@@ -5,7 +5,7 @@
  *
  *   node scripts/build-merkle.cjs <recipients.csv|.json> \
  *        --policy schedule/airdrop-policy.json \
- *        [--tge <unix seconds>] [--out build/merkle]
+ *        --expect-total <wei> [--tge <unix seconds>] [--out build/merkle]
  *
  * WHY THIS FILE IS LONGER THAN THE CONTRACT
  *
@@ -86,6 +86,21 @@ function loadRecipients(file) {
 // loadPolicy 와 buildDistribution 양쪽에서 부른다. monthSeconds 검사가 이미
 // 같은 이유로 두 곳에 있다: buildDistribution 은 테스트와 메모리상 정책 객체가
 // 직접 호출하는 진입점이고, 파일을 거치지 않는다.
+// 7차 감사 M-1. 빌더도 set-root 도 minClaimAmount 라는 단어를 몰랐다(양쪽 grep 0건).
+// 컨트랙트의 바닥값이 어떤 리프보다 높으면 그 리프는 루트가 동결되는 순간
+// 영구 청구 불가다. 실측: 실입력 1,205명 빌드의 round 0 에 1 HCOW 미만 리프가
+// 229개, 합 192.19 HCOW. 대표 결정으로 빌더가 대조하고 중단한다.
+function assertFloor(v) {
+  if (v === undefined || v === null) return 0n;
+  const raw = String(v).trim();
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `policy.minClaimAmount "${v}" must be an integer number of wei, written as a string. ` +
+      'It is compared against leaf amounts, which are wei.');
+  }
+  return BigInt(raw);
+}
+
 function assertBucket(b) {
   if (!/^\d+$/.test(String(b.total).trim())) {
     throw new Error(`policy.bucket.total "${b.total}" must be an integer number of wei, written as a string`);
@@ -134,6 +149,7 @@ function loadPolicy(file) {
     if (b[k] === undefined) throw new Error(`policy.bucket.${k} is required; it is what check 6 measures against`);
   }
   assertBucket(b);
+  assertFloor(p.minClaimAmount);
   return p;
 }
 
@@ -192,7 +208,7 @@ function vestedAt(bucket, tgeTime, ts, month) {
  * Throws on the first thing that is wrong. Returns
  * { rounds, dropped, consolidated, totalIn, warnings }.
  */
-function buildDistribution(rawRows, policy, { tgeTime } = {}) {
+function buildDistribution(rawRows, policy, { tgeTime, expectTotal } = {}) {
   const month = Number(policy.monthSeconds);
   // loadPolicy checks this too. It is repeated here because buildDistribution
   // is also called directly by the tests and by anything that builds a policy
@@ -418,6 +434,55 @@ function buildDistribution(rawRows, policy, { tgeTime } = {}) {
     r.cumulative = cumulative.toString();
   }
 
+  // ---- check 8. 바닥값 (7차 M-1) ----------------------------------------
+  //
+  // 리프 하나라도 컨트랙트의 바닥값보다 작으면 그 리프는 회차가 열리는 순간
+  // 영구 청구 불가가 된다. 루트는 동결되고 트리로는 고칠 수 없다.
+  const floor = assertFloor(policy.minClaimAmount);
+  if (floor > 0n) {
+    let below = 0, smallest = null, example = null;
+    for (const r of rounds) {
+      if (!r) continue;
+      for (const [account, c] of Object.entries(r.claims)) {
+        const amt = BigInt(c.amount);
+        if (amt < floor) {
+          below += 1;
+          if (smallest === null || amt < smallest) { smallest = amt; example = `${account} in round ${r.roundId}`; }
+        }
+      }
+    }
+    if (below > 0) {
+      throw new Error(
+        `${below} leaf/leaves are below policy.minClaimAmount ${floor} wei. The smallest is ` +
+        `${smallest} wei (${example}). A round's root freezes when it opens, so every one of those ` +
+        'entries would be permanently unclaimable. Lower the floor, consolidate those recipients ' +
+        'into a single round, or raise their amounts. Nothing has been written.');
+    }
+  }
+
+  // ---- check 9. 공표 총액 (7차 M-2) --------------------------------------
+  //
+  // check 5 는 같은 rows 에서 나온 두 합을 비교하므로 상류의 반올림 방향을
+  // 볼 수 없다. 실측: floor / round-half / ceil 세 입력이 전부 "grand total
+  // exact" 를 출력했다. 유일한 상한이던 policy.bucket.total 은 실제 배포의
+  // 85배였다. 공표한 숫자를 밖에서 넣어야 이 구멍이 닫힌다.
+  if (expectTotal !== undefined && expectTotal !== null) {
+    const raw = String(expectTotal).trim();
+    if (!/^\d+$/.test(raw)) {
+      throw new Error(
+        `expectTotal "${expectTotal}" must be an integer number of wei, written as a string. ` +
+        'A figure like 95337.92 is HCOW, not wei; multiply it out before passing it.');
+    }
+    const want = BigInt(raw);
+    if (totalIn !== want) {
+      const diff = totalIn > want ? totalIn - want : want - totalIn;
+      throw new Error(
+        `the input distributes ${totalIn} wei but the announced total is ${want} wei, a difference ` +
+        `of ${diff} wei. This is the only check that can see a rounding direction chosen upstream, ` +
+        'and it is what the announcement committed to. Nothing has been written.');
+    }
+  }
+
   return { rounds, dropped, consolidated, warnings, totalIn, tgeTime: tge, month };
 }
 
@@ -437,13 +502,24 @@ function main(argv) {
   const flag = (name, dflt) => (opts[name] === undefined ? dflt : opts[name]);
   const input = positional[0];
   if (!input) {
-    console.error('usage: node scripts/build-merkle.cjs <recipients.csv|.json> --policy <policy.json> [--tge <unix>] [--out build/merkle]');
+    console.error('usage: node scripts/build-merkle.cjs <recipients.csv|.json> --policy <policy.json> --expect-total <wei> [--tge <unix>] [--out build/merkle]');
     process.exitCode = 1;
     return;
   }
   const policyFile = flag('policy', 'schedule/airdrop-policy.example.json');
   const outDir = flag('out', 'build/merkle');
   const tgeArg = flag('tge', undefined);
+  // 7차 감사 M-2. 기본값을 두지 않는다. 기본값이 있으면 그게 곧 검사를 끄는
+  // 방법이 되고, 이 검사는 공지한 숫자와 트리를 잇는 유일한 연결이다.
+  const expectTotal = flag('expect-total', undefined);
+  if (expectTotal === undefined) {
+    console.error(
+      'missing --expect-total <wei>. It is the figure the distribution was announced with, in wei, ' +
+      'and the build refuses to run without it. Every other total check here compares the input with ' +
+      'itself; this is the only one that can catch a rounding direction chosen before this script ran.');
+    process.exitCode = 1;
+    return;
+  }
 
   const policy = loadPolicy(path.resolve(policyFile));
   const rows = loadRecipients(path.resolve(input));
@@ -453,7 +529,7 @@ function main(argv) {
     console.log(`          ${policy.meta.warning.split('.')[0]}.`);
   }
 
-  const d = buildDistribution(rows, policy, { tgeTime: tgeArg ? Number(tgeArg) : undefined });
+  const d = buildDistribution(rows, policy, { tgeTime: tgeArg ? Number(tgeArg) : undefined, expectTotal });
 
   console.log(`TGE       ${new Date(d.tgeTime * 1000).toISOString()}   months are ${d.month}s, as in HCOWVesting\n`);
   console.log('  round  opens                       recipients        distributed        vested by then');
