@@ -83,6 +83,35 @@ function writeRecord(chainId, obj) {
 }
 
 /**
+ * Reads a flag whose job is to SUPPRESS a dangerous action (PRINT_ONLY,
+ * DRY_RUN).
+ *
+ * These are the opposite of ALLOW_GAP / REPLACE_ANCHOR / ALLOW_SAME_ROOT.
+ * Those enable something dangerous, so `!== '1'` is right: any spelling the
+ * author did not intend leaves the danger switched off. A suppressor compared
+ * the same way fails the other direction — `PRINT_ONLY=1` was not the literal
+ * 'yes', so the transaction went out for real. The fourth adversarial audit
+ * (2026-09-18, C-2) sent a live setRoot that way, and the repository taught
+ * the habit itself: seal.cjs wanted 'yes', anchor.cjs wanted '1'.
+ *
+ * So: accept every ordinary spelling of yes and of no, and THROW on anything
+ * else rather than guessing. A typo must not be read as "go ahead".
+ */
+const DRY_YES = new Set(['yes', 'y', '1', 'true', 'on']);
+const DRY_NO = new Set(['', 'no', 'n', '0', 'false', 'off']);
+function dryFlag(name) {
+  const raw = process.env[name];
+  if (raw === undefined) return false;
+  const v = String(raw).trim().toLowerCase();
+  if (DRY_YES.has(v)) return true;
+  if (DRY_NO.has(v)) return false;
+  throw new Error(
+    `${name}=${JSON.stringify(raw)} is not a value this script understands. ` +
+    `Use one of ${[...DRY_YES].join(' / ')} to suppress the transaction, or unset it to send. ` +
+    'Refusing to guess, because guessing wrong here sends a real transaction.');
+}
+
+/**
  * Either sends the transaction, or prints what would be sent.
  *
  * PRINT_ONLY exists because on mainnet the owner of the vesting contract is
@@ -93,7 +122,7 @@ function writeRecord(chainId, obj) {
 async function sendOrPrint(label, contract, method, args, { from }) {
   const data = contract.interface.encodeFunctionData(method, args);
   const to = await contract.getAddress();
-  if (process.env.PRINT_ONLY === 'yes') {
+  if (dryFlag('PRINT_ONLY')) {
     console.log(`\n  ${label}`);
     console.log(`    from   ${from}`);
     console.log(`    to     ${to}`);
@@ -107,4 +136,4 @@ async function sendOrPrint(label, contract, method, args, { from }) {
   return rc;
 }
 
-module.exports = { connect, artifact, deploy, at, readRecord, writeRecord, sendOrPrint, ethers, BSC_MAINNET, BSC_TESTNET };
+module.exports = { connect, artifact, deploy, at, readRecord, writeRecord, sendOrPrint, dryFlag, ethers, BSC_MAINNET, BSC_TESTNET };

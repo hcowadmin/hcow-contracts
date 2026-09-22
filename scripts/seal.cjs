@@ -29,7 +29,7 @@
 // The approval is for the exact shortfall, never unlimited.
 
 const path = require('path');
-const { connect, at, readRecord, writeRecord, sendOrPrint, ethers } = require('./_connect.cjs');
+const { connect, at, readRecord, writeRecord, sendOrPrint, ethers, dryFlag } = require('./_connect.cjs');
 const { loadSchedule } = require('./commitcheck.cjs');
 const { commitments } = require('../vestcommit.cjs');
 
@@ -44,8 +44,8 @@ const ok = (name, cond, detail) => {
 };
 
 async function main() {
-  const printOnly = process.env.PRINT_ONLY === 'yes';
-  const dryRun = process.env.DRY_RUN === 'yes';
+  const printOnly = dryFlag('PRINT_ONLY');
+  const dryRun = dryFlag('DRY_RUN');
   const { provider, signer, net, mainnet } = await connect({
     needSigner: !printOnly && !dryRun, keyVar: 'TREASURY_KEY',
   });

@@ -4,14 +4,22 @@
   "private": true,
   "scripts": {
     "compile": "node compile.cjs",
-    "test": "node compile.cjs && node test.cjs && node audit.cjs && forge test",
+    "test": "node compile.cjs && node test.cjs && node audit.cjs && node test/HCOWClaim.test.cjs && node test/claim-boundaries.test.cjs && node test/build-merkle.test.cjs && node test/builder-guards.test.cjs && node test/ops-guards.test.cjs && node test/HCOWAnchor.test.cjs && forge test",
+    "test:claim": "node compile.cjs && node test/HCOWClaim.test.cjs && node test/claim-boundaries.test.cjs && node test/build-merkle.test.cjs && node test/builder-guards.test.cjs && node test/ops-guards.test.cjs",
     "test:fuzz": "forge test",
     "test:fuzz:deep": "FOUNDRY_PROFILE=deep forge test",
     "test:mutate": "node scripts/mutate.cjs",
     "commit": "node scripts/commitcheck.cjs",
     "deploy": "node scripts/deploy.cjs",
     "load": "node scripts/load.cjs",
-    "seal": "node scripts/seal.cjs"
+    "seal": "node scripts/seal.cjs",
+    "merkle": "node scripts/build-merkle.cjs",
+    "deploy:claim": "node scripts/deploy-claim.cjs",
+    "setroot": "node scripts/set-root.cjs",
+    "test:anchor": "node compile.cjs && node test/HCOWAnchor.test.cjs",
+    "deploy:anchor": "node scripts/deploy-anchor.cjs",
+    "anchor": "node scripts/anchor.cjs",
+    "test:ops": "node compile.cjs && node test/builder-guards.test.cjs && node test/ops-guards.test.cjs"
   },
   "devDependencies": {
     "@ethereumjs/block": "5.3.0",

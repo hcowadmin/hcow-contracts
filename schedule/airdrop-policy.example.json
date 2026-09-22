@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "name": "HCOW Community/Airdrop unlock policy — EXAMPLE",
+    "warning": "EXAMPLE ONLY, NOT SIGNED OFF. Every ratio below is copied from spec v0.1 section 3, which states in the same breath that the numbers are not final. Spec section 10 lists what is still undecided: per-category totals, the minimum claim amount, the claim deadline, the sweep recipient, whether referral commission is its own category, and it fixes one thing, that the season 1 prize is TGE-in-full and therefore belongs in 'other'. Copy this file, fill in the agreed numbers, and keep the copy next to the tree it produced.",
+    "source": "HCOW_Claim_Contract_Spec_v0.1.md section 3"
+  },
+
+  "tgeTime": 0,
+
+  "monthSeconds": 2592000,
+
+  "dustThreshold": "0",
+
+  "categories": {
+    "miniapp":    { "label": "미니앱 보상",      "tgeBps": 3300,  "tailRounds": 2 },
+    "taskon":     { "label": "TaskOn",           "tgeBps": 2000,  "tailRounds": 4 },
+    "awareness":  { "label": "인식개선 프로그램", "tgeBps": 10000, "tailRounds": 0 },
+    "buildphase": { "label": "빌드페이즈",        "tgeBps": 2500,  "tailRounds": 3 },
+    "other":      { "label": "기타 소액 보상",    "tgeBps": 10000, "tailRounds": 0 }
+  },
+
+  "bucket": {
+    "label": "Community / Airdrop",
+    "total": "8000000000000000000000000",
+    "tgeBps": 3750,
+    "cliffMonths": 0,
+    "linearMonths": 6
+  }
+}

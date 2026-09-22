@@ -1,13 +1,17 @@
-# HCOW Contracts — HCOWToken and HCOWVesting
+# HCOW Contracts — HCOWToken, HCOWVesting and HCOWClaim
 
 Reference implementations written by HashCow. Solidity 0.8.34, OpenZeppelin 5.0.2.
-Both compile clean with zero warnings and pass 161 assertions, plus 20 Foundry tests including 13 invariant properties. Measured 29 August 2026.
+The first two compile clean with zero warnings and pass 161 assertions, plus 20 Foundry tests including 13 invariant properties. Measured 29 August 2026.
+`HCOWClaim` was added afterwards and is covered by 139 further assertions of its own; it is
+additive and changes nothing about the two contracts above.
 
 ```
 npm test           # compiles, runs both suites below, then forge test
 node compile.cjs   # solc 0.8.34 pinned, optimizer on, 200 runs, evmVersion paris
 node test.cjs      # functional suite, 94 assertions, in-process EVM
 node audit.cjs     # adversarial and property suite, 67 assertions
+node test/HCOWClaim.test.cjs     # the sixteen tests of the claim spec, 108 assertions
+node test/build-merkle.test.cjs  # the seven tree-generator checks, 31 assertions
 forge test         # 14 machine-searched invariants + 6 tests, 32,768 calls each
 npm run test:fuzz:deep   # the same, 2000 runs x 400 calls
 npm run test:mutate      # deletes each guard in turn and checks the suite notices
@@ -350,6 +354,197 @@ of TGE.
 
 ---
 
+## HCOWClaim
+
+`HCOWVesting` vests to nine **bucket** addresses, not to people. The
+`Community / Airdrop` bucket — 8,000,000 HCOW, 37.5% at TGE, no cliff, six
+month linear — has `HCOWClaim` as its beneficiary. Vesting releases flow into
+it and ~20,000 individual recipients pull from it. Nothing about the six
+audited contracts changes: this one is additive, and to `HCOWVesting` it is an
+ordinary beneficiary address.
+
+Recipients claim themselves, from `app.hash-cow.io`, paying their own gas.
+Nothing is pushed.
+
+```
+HCOWClaim(token, owner, claimDeadline)     4,625 bytes deployed
+```
+
+Uniswap's `MerkleDistributor` is the reference implementation and the claim
+path is deliberately its claim path: one root, a bitmap of spent indices, and a
+transfer. The one structural change is that everything is keyed by round, so
+one contract serves every unlock round of every airdrop category.
+
+### What it guarantees
+
+| | |
+|---|---|
+| A round's root freezes when the round opens | `setRoot` reverts with `RoundAlreadyStarted` at or after `startTime`, forever, including a call that would set the identical root. An operator who could rewrite a live root could pay any address any amount |
+| A root can still be corrected before the round opens | And every correction emits `RoundSet`, so a rewrite cannot happen quietly |
+| One claim per round per entry | Per-round bitmap. Rounds share nothing, so a claimed round 0 does not close round 1 |
+| A failed transfer never marks an entry claimed | The balance is checked first and the entry is marked before the transfer, so an underfunded round reverts whole with `InsufficientBalance` and the bit is rolled back with it. This is the standard permanent-loss bug in multi-round distributors, and test 9 is the one that proves it is absent |
+| The owner's only route to the tokens is `sweep`, and it is shut until `claimDeadline` | There is no other transfer path out of this contract |
+| The deadline extends, never shortens | `extendDeadline` refuses anything at or below the current value. A shortenable deadline is confiscation on notice |
+| `minClaimAmount` is raised only before the first round opens | Afterwards it moves down and never up, reverting with `MinClaimAmountRaiseClosed`. A floor raised over a live distribution excludes exactly the small recipients the floor exists to spare gas, which is shortening the deadline reached by another route |
+| Ownership cannot be renounced | Renouncing would end `setRoot` too, so no later round could ever open and everything still owed would be stranded |
+| No unlock policy is in the contract | It knows only "may this address take this amount in this round". Ratios live in the tree |
+
+`owner` is the treasury Safe, passed at deployment. `minClaimAmount` starts at
+zero, meaning no floor, and is the parameter left for spec section 10 item 2.
+
+Every power the owner holds here runs one way once claiming has begun, and the
+floor is no exception: it can be raised only while `block.timestamp` is still
+before `earliestRoundStart`, the earliest start time ever given to any round.
+`earliestRoundStart` only ever moves earlier. It does not follow an unopened
+round that `setRoot` pushes later — the rounds mapping is sparse and cannot be
+enumerated, and recomputing a true minimum would mean carrying a list of every
+round for the sake of one owner-only call. The consequence is that the window
+for raising the floor can close earlier than the first round actually opens,
+never later, which is the only direction it is safe to be wrong in.
+
+### Unlock policy is not in the contract, and must not be
+
+The airdrop categories unlock on different curves, and the numbers are not
+final. They belong in `schedule/airdrop-policy.json` — copy
+`schedule/airdrop-policy.example.json`, which carries the drafted ratios and
+says on its face that they are drafted. The generator applies them and the
+contract sees only amounts, so a policy change is a new tree rather than a new
+contract.
+
+**Months are 30 days**, the same `MONTH` `HCOWVesting.sol` uses. The generator
+refuses a policy file that says otherwise. Calendar months would drift the
+round boundaries off the grid the tokens actually vest on, and the failure mode
+is a round that opens while the tokens funding it are still vesting.
+
+### Building the trees
+
+```bash
+node scripts/build-merkle.cjs recipients.csv      --policy schedule/airdrop-policy.json      --tge <unix seconds> --out build/merkle
+```
+
+Input is CSV or JSON with `account`, `category` and `totalAmount` in wei. Output
+is `build/merkle/rounds.json` — the `setRoot` arguments — and one
+`round-<n>.json` per round holding every index, amount and proof.
+
+**More accidents happen here than in the contract**, so the generator proves
+the whole of spec section 6 before it writes anything, and stops rather than
+warns:
+
+1. every address is valid and EIP-55 checksummed — a lowercase address is
+   refused rather than normalised, because a checksum is the only thing between
+   a typo and a payment to nobody
+2. no address appears twice — two rows means two leaves in one round and two
+   claims against one entitlement
+3. rows totalling zero are dropped, and no zero amount reaches a tree
+4. each account's round amounts sum to exactly its input total, remainder
+   included. The remainder of the division goes to the **last** round
+5. the sum over every round equals the input file's total
+6. cumulative demand through round *n* never exceeds what `HCOWVesting` will
+   have released into this contract by round *n*'s start — the same vesting
+   arithmetic, reimplemented against the bucket figures in the policy file
+7. each root is computed twice, by two implementations sharing no code and no
+   library — `js-sha3` iterating level by level against `ethers` recursing —
+   and then every generated proof is replayed to the root by a third function
+   that uses neither builder
+
+The seventh is the one worth insisting on. Running the same function twice is
+not a check.
+
+Dust (spec 4-3) is handled in the tree, which is option 1 of the two the spec
+offers: set `dustThreshold` in the policy file and any account whose split
+would put a round below it is paid in full in round 0 instead. The default is
+zero, which disables it. `minClaimAmount` on the contract is option 2, left at
+zero and unused.
+
+### Claim deployment order
+
+This extends the list above; steps 1-3 there are unchanged.
+
+```
+1  Deploy HCOWClaim (owner = treasury Safe, claimDeadline set deliberately)
+2  Point HCOWVesting's Community/Airdrop schedule at the HCOWClaim address
+3  fundAndSeal()
+4  After TGE, release the bucket so tokens arrive at HCOWClaim
+5  Register round 0's root (setRoot)
+6  Open the claim page
+7  Repeat step 5 for each later round
+```
+
+```bash
+RPC_URL=... CHAIN_ID=97 DEPLOYER_KEY=0x... HCOW_ADDRESS=0x... CLAIM_OWNER=0x<treasury Safe> CLAIM_DEADLINE=<unix seconds> node scripts/deploy-claim.cjs
+```
+
+**Step 2 is the point of no return.** `seal()` fixes every beneficiary forever,
+so `HCOWClaim` has to exist and be final before sealing. Deploy it before
+`scripts/load.cjs` runs, not between loading and sealing. `deploy-claim.cjs`
+reads `sealed_()` and refuses to deploy against an already-sealed vesting
+contract, because a claim contract deployed after the seal looks correct,
+verifies on BscScan, and silently never receives a token.
+
+`claimDeadline` is passed here and can only ever move later. Set it long.
+
+### Registering a round
+
+```bash
+RPC_URL=... CHAIN_ID=56 TREASURY_KEY=0x... node scripts/set-root.cjs --rounds build/merkle/rounds.json --round 0
+
+PRINT_ONLY=yes ...   # prints to / data for the Safe instead of sending
+```
+
+Before anything is signed the script rebuilds the round's tree from
+`round-<n>.json` by both paths, checks the rebuilt root against both files,
+replays every shipped proof, and then checks on chain that the round has not
+already opened and that the contract holds enough to pay it. The owner is a
+Safe, so the real call is normally `PRINT_ONLY=yes` and the printed `data`
+submitted through the Safe.
+
+**Check the root on screen against `rounds.json` before signing.** After
+`startTime` this call can never be made again for that round.
+
+### Operational cautions
+
+- **`startTime` is not validated against the current block, on purpose.** A
+  queued Safe transaction executes minutes or days after it is prepared, and a
+  freshness check would reject the correct call for being late. The cost is
+  that a round registered with a `startTime` already past opens and freezes in
+  the same block, with no window to correct the root. `set-root.cjs` refuses
+  that case; a call assembled by hand has nothing to catch it.
+- **Register a round before the tokens for it arrive, not after.** Claims
+  against an underfunded round revert cleanly and cost the claimant gas for
+  nothing, which is an annoyance. The reverse — opening late — is worse only in
+  that it is noisier.
+- **`sweep` moves whatever it is told to move, including tokens a recipient has
+  not claimed yet.** It is deadline-gated and nothing more. Publish the
+  deadline, and extend it rather than arguing about it.
+- **Every round's root is public, and so is every proof.** The tree files are
+  the claim page's data. Nothing in them is secret and nothing in them should
+  be edited by hand.
+- A claim may be submitted by anyone for anyone. The tokens always go to
+  `account`, never to the caller, so a recipient without gas can be paid by
+  somebody else and nobody can redirect a payment by calling.
+
+### What the sixteen tests cover
+
+`test/HCOWClaim.test.cjs` is spec section 7, numbered, in chronological order
+because the contract's whole shape is what is allowed before and after which
+instant. The trees it tests against are built by `scripts/build-merkle.cjs`
+rather than by a fixture: a distributor tested against proofs from a generator
+that is not the production generator has tested nothing about production.
+
+Every revert is asserted **by name**. "It reverted" is satisfied by any of the
+several guards standing on the claim path, so an assertion written that way
+stays green when the guard under test is deleted.
+
+`npm run test:mutate` carries nine mutations for this contract and each is
+caught by the assertion that names it: the pre-transfer balance check, the
+already-claimed guard, the round start gate, the frozen root, the one-way
+deadline, the one-way floor, the write that records `earliestRoundStart`, the
+sweep gate, and the leaf preimage — that last one because the leaf is one
+definition living in two files, `HCOWClaim._claim` and `scripts/merkle.cjs`,
+and nothing but a test holds them together.
+
+---
+
 ## What is still open
 
 | Item | Effect |
@@ -359,4 +554,10 @@ of TGE.
 | Treasury custody | Single key or multisig. If single key, use a hardware wallet and fund and seal the vesting contract early to limit exposure |
 | Beneficiary cap | `MAX_BENEFICIARIES` is 200. The published allocation uses nine |
 | Rescue recipient | Constructor argument, fixed forever. Where a foreign token sent here by mistake goes. Not the deployer by default; decide it deliberately |
+| Airdrop category totals | Per-category sums for miniapp / TaskOn / awareness / build-phase / other. Check 6 of the generator refuses a set that outruns the bucket's release curve, but it cannot tell you the right numbers |
+| `minClaimAmount` | Contract parameter, starts at zero meaning no floor. Dust is handled in the tree instead; this is the second option, left open. Decide it before the first round opens: after that it can only be lowered |
+| `claimDeadline` | Constructor argument. Extends, never shortens, so set it long |
+| Sweep recipient | An argument to `sweep`, chosen per call rather than fixed at deployment. Decide it before the deadline, not on the day |
+| Referral commission | Whether the 1% belongs to "miniapp rewards" or is its own category. It changes the curve applied to those balances |
+| Season 1 prize (2,500 HCOW) | Published rules say paid at TGE, so it must be 100% at TGE. Classifying it as "other" gets that right |
 | The re-audit | The first report is answered in full. The answers themselves have been reviewed by nobody outside this repository. The audit must ultimately cover the exact source that gets deployed, not an earlier revision |

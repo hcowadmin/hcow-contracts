@@ -21,12 +21,12 @@
 // half built.
 
 const path = require('path');
-const { connect, at, readRecord, sendOrPrint, ethers } = require('./_connect.cjs');
+const { connect, at, readRecord, sendOrPrint, ethers, dryFlag } = require('./_connect.cjs');
 const { loadSchedule } = require('./commitcheck.cjs');
 const { commitments } = require('../vestcommit.cjs');
 
 async function main() {
-  const printOnly = process.env.PRINT_ONLY === 'yes';
+  const printOnly = dryFlag('PRINT_ONLY');
   const { provider, signer, net, mainnet } = await connect({
     needSigner: !printOnly, keyVar: 'TREASURY_KEY',
   });

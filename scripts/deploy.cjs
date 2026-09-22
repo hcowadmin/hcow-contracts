@@ -209,7 +209,11 @@ async function main() {
       tgeUnlock: String(c.unlock),
       scheduleHash: c.hash,
     },
-    addresses: { HCOWToken: token, HCOWVesting: vesting },
+    // 3차 감사 A-6. 이전 판은 addresses 를 통째로 새로 만들어
+    // 기존 HCOWAnchor 키를 지웠다. 그러면 deploy-anchor.cjs 의 REPLACE_ANCHOR
+    // 가드가 "기존 배포 없음" 으로 보고 조용히 풀리고, anchor.cjs 의
+    // record.addresses?.HCOWAnchor 폴백도 같이 깨진다. 병합한다.
+    addresses: { ...(prev.addresses || {}), HCOWToken: token, HCOWVesting: vesting },
     deploymentTxs: {
       ...(tokenTx ? { HCOWToken: tokenTx } : {}),
       HCOWVesting: v.deploymentTransaction().hash,
