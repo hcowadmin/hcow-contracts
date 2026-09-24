@@ -478,7 +478,11 @@ async function main() {
   const c = await deploy('HCOWClaim', signer, [token, owner, deadline, notice, window]);
   const claim = await c.getAddress();
   const tx = c.deploymentTransaction().hash;
-  console.log(`\nHCOWClaim ${claim}  tx ${tx}`);
+  // set-root.cjs 는 RoundSet 이벤트를 이 블록부터 읽는다. 영수증에서 매번 다시 찾게
+  // 하지 않는 이유: 노드는 오래된 트랜잭션 색인을 지운다 (geth 기본 약 235만 블록,
+  // BSC 로 약 20일). 그 뒤에는 영수증이 null 이다. (RoundSet 조회 재검 F4)
+  const deployedBlock = (await c.deploymentTransaction().wait()).blockNumber;
+  console.log(`\nHCOWClaim ${claim}  tx ${tx}  block ${deployedBlock}`);
 
   // Read the constructor arguments back off the chain rather than trusting
   // what was sent. A wrongly encoded argument is silent and this is the last
@@ -509,6 +513,7 @@ async function main() {
     deploymentTxs: { ...(record.deploymentTxs || {}), HCOWClaim: tx },
     claim: {
       deployedAt: new Date().toISOString(),
+      deployedBlock,
       deployedBy: me,
       owner,
       claimDeadline: deadline,

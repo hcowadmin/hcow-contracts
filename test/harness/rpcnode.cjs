@@ -25,7 +25,14 @@ const art = (n) => JSON.parse(fs.readFileSync(path.join(ROOT, 'artifacts', `${n}
 // (hcow_isTestHarness → true). _connect.cjs 는 HCOW_RECORD_DIR 가 설정돼 있으면
 // 이 대답을 요구한다. 루프백 주소만으로는 로컬 BSC 노드나 SSH 터널과 구분되지
 // 않았다. false 로 끄면 "루프백이지만 하네스가 아닌 노드" 를 흉내낸다.
-async function makeNode({ chainId, now, balances: balancesIn = {}, harnessMarker = true }) {
+// logRangeLimit: eth_getLogs 가 한 번에 받는 블록 범위의 상한. 공개 BSC RPC 는 이
+// 범위를 제한한다 (예: 5000). 설정하면 그보다 넓은 요청을 에러로 돌려준다.
+// logFailEvery: n 번째 eth_getLogs 마다 일시적 오류를 낸다 (불안정한 공개 RPC 흉내).
+// hideLogBlocks: 이 블록들의 로그를 eth_getLogs 가 돌려주지 않는다 (일부를 빠뜨리는 노드 흉내).
+async function makeNode({ chainId, now, balances: balancesIn = {}, harnessMarker = true, logRangeLimit = 0,
+  faithfulHead = false, logFailEvery = 0, hideLogBlocks = [] }) {
+  let getLogsCalls = 0;
+  const hidden = new Set(hideLogBlocks.map((b) => BigInt(b)));
   // 10차 감사: 키를 대소문자 그대로 조회해서, 체크섬 표기로 넣은 0 이 조용히
   // 1 BNB 로 떨어졌다. 소문자로 정규화한다.
   const balances = Object.fromEntries(
@@ -35,6 +42,7 @@ async function makeNode({ chainId, now, balances: balancesIn = {}, harnessMarker
   let ts = BigInt(now);
   let blockNumber = 1n;
   const receipts = new Map();
+  const headNum = () => (faithfulHead ? (blockNumber > 0n ? blockNumber - 1n : 0n) : blockNumber);
 
   const mkBlock = () => Block.fromBlockData(
     { header: { timestamp: ts, gasLimit: 30000000n, baseFeePerGas: 0n, number: blockNumber } },
@@ -43,6 +51,8 @@ async function makeNode({ chainId, now, balances: balancesIn = {}, harnessMarker
   const api = {
     vm, common,
     setTime: (t) => { ts = BigInt(t); },
+    hideLogs: (b) => hidden.add(BigInt(b)),
+    showAllLogs: () => hidden.clear(),
     now: () => ts,
     async callRaw(to, data, from) {
       const r = await vm.evm.runCall({
@@ -79,7 +89,12 @@ async function makeNode({ chainId, now, balances: balancesIn = {}, harnessMarker
         case 'eth_chainId': return ok('0x' + chainId.toString(16));
         case 'net_version': return ok(String(chainId));
         case 'hcow_isTestHarness': return harnessMarker ? ok(true) : err('unsupported method ' + m);
-        case 'eth_blockNumber': return ok('0x' + blockNumber.toString(16));
+        // RoundSet 조회 재검 F5: 이 노드는 "다음에 쓸 블록 번호" 를 돌려준다. 실제 노드는
+        // 마지막으로 채굴된 블록을 돌려준다. 그 차이 때문에 머리 블록을 빠뜨리는 버그가
+        // 보이지 않았다. faithfulHead 로 켜면 실제 노드처럼 돌려준다. 기본값으로 바꾸지 않는
+        // 이유: 이 노드는 새 블록을 스스로 만들지 않으므로, ethers 의 tx.wait() 가 캐시된
+        // 옛 블록 번호로 확인 수 0 을 계산하면 오지 않을 다음 블록을 영원히 기다린다.
+        case 'eth_blockNumber': return ok('0x' + headNum().toString(16));
         case 'eth_gasPrice': return ok('0x1');
         case 'eth_getBalance': {
           const key = String(p[0]).toLowerCase();
@@ -98,7 +113,7 @@ async function makeNode({ chainId, now, balances: balancesIn = {}, harnessMarker
         }
         case 'eth_getBlockByNumber': {
           return ok({
-            number: '0x' + blockNumber.toString(16),
+            number: '0x' + headNum().toString(16),
             hash: '0x' + '22'.repeat(32), parentHash: '0x' + '00'.repeat(32),
             timestamp: '0x' + ts.toString(16), gasLimit: '0x1c9c380', gasUsed: '0x0',
             miner: '0x' + '00'.repeat(20), extraData: '0x', transactions: [],
@@ -148,6 +163,31 @@ async function makeNode({ chainId, now, balances: balancesIn = {}, harnessMarker
           return ok(hash);
         }
         case 'eth_getTransactionReceipt': return ok(receipts.get(p[0]) || null);
+        case 'eth_getLogs': {
+          if (logFailEvery && ++getLogsCalls % logFailEvery === 0) return err('temporarily unavailable, try again');
+          const q = p[0] || {};
+          const num = (v, dflt) => (v === undefined || v === 'latest' || v === 'pending' || v === 'safe' || v === 'finalized')
+            ? dflt : v === 'earliest' ? 0n : BigInt(v);
+          const last = blockNumber - 1n;
+          const from = num(q.fromBlock, last), to = num(q.toBlock, last);
+          if (logRangeLimit && to - from + 1n > BigInt(logRangeLimit)) {
+            return err(`block range too large: ${to - from + 1n} > ${logRangeLimit}`);
+          }
+          const addrs = q.address ? (Array.isArray(q.address) ? q.address : [q.address]).map((a) => a.toLowerCase()) : null;
+          const t0 = q.topics && q.topics[0] ? (Array.isArray(q.topics[0]) ? q.topics[0] : [q.topics[0]]).map((t) => t.toLowerCase()) : null;
+          const out = [];
+          for (const rc of receipts.values()) {
+            if (rc.status !== '0x1') continue;
+            const bn = BigInt(rc.blockNumber);
+            if (bn < from || bn > to || hidden.has(bn)) continue;
+            for (const l of rc.logs) {
+              if (addrs && !addrs.includes(l.address.toLowerCase())) continue;
+              if (t0 && !t0.includes(String(l.topics[0]).toLowerCase())) continue;
+              out.push(l);
+            }
+          }
+          return ok(out);
+        }
         case 'eth_getTransactionByHash': {
           const rc = receipts.get(p[0]);
           if (!rc) return ok(null);

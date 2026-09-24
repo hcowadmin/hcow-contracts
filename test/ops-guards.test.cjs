@@ -238,6 +238,12 @@ const env = (s) => ({
     const dep1 = await run('deploy-claim.cjs', { ...env(s), ALLOW_EOA_OWNER: 'yes' });
     ok(dep1.status === 0, 'a claim contract is deployed for these cases');
     const claimAddr = readRec(56).addresses.HCOWClaim;
+    {
+      // set-root 의 RoundSet 조회가 시작 블록으로 쓴다. 영수증은 몇 주 뒤 노드에서 사라진다.
+      const rc = await f.provider.getTransactionReceipt(readRec(56).deploymentTxs.HCOWClaim);
+      ok(Number(readRec(56).claim.deployedBlock) === rc.blockNumber,
+        'deploy-claim 은 claim 이 배포된 블록 번호를 레코드에 남긴다 (RoundSet 조회 재검 F4)');
+    }
 
     // A one-entry tree, written by hand in the shape build-merkle.cjs emits.
     const { buildRound } = require('../scripts/merkle.cjs');
@@ -485,6 +491,8 @@ const env = (s) => ({
     for (let attempt = 0; ; attempt++) {
       try {
         const c = await dep('HCOWClaim', s.f.deployer, [token, s.treasury, deadline, notice, 7776000]);
+        // RoundSet 조회 (14·15차 잔여 조치) 가 시작 블록을 레코드의 배포 트랜잭션에서 읽는다.
+        s.claimTx = c.deploymentTransaction().hash;
         return c.getAddress();
       } catch (e) {
         if (attempt >= 2 || !/correct nonce/.test(String(e.message || e))) throw e;
@@ -500,7 +508,7 @@ const env = (s) => ({
   async function mainReady(s, { over = {}, n = 9, total = ethers.parseUnits('200000000', 18), claimOpts = {} } = {}) {
     const claim = await realClaim(s, claimOpts);
     writeSchedule(total, n, { 3: { beneficiary: claim }, ...over });
-    mainRec(s, { addresses: { HCOWToken: s.token, HCOWClaim: claim } });
+    mainRec(s, { addresses: { HCOWToken: s.token, HCOWClaim: claim }, deploymentTxs: { HCOWClaim: s.claimTx } });
     s.claim = claim;
     return claim;
   }
@@ -2270,6 +2278,177 @@ const env = (s) => ({
     t.f.node.setTime(plan[0].start + 60);
     says(await srNV(1), 'has already opened', '이미 열린 앞 라운드의 루트가 파일과 다르면 거부된다 (14차)');
     fs.rmSync(dirNV, { recursive: true, force: true });
+  }
+
+  console.log('\n7차 M-7 — set-root 는 컨트랙트가 ClaimWindowTooShort 로 거부할 라운드를 미리 막는다\n');
+  {
+    clearRec();
+    const t = await stageTestnet({ eoa: true });
+    const claim = await realClaim(t);
+    writeRec(97, { chainId: 97, treasury: t.treasury, addresses: { HCOWToken: t.token, HCOWClaim: claim } });
+    await (await t.tk.connect(t.f.treasury).transfer(claim, 10n * E)).wait();
+    const cl = new ethers.Contract(claim, art('HCOWClaim').abi, t.f.provider);
+    const latest = Number(await cl.claimDeadline()) - Number(await cl.minClaimWindow());
+    const { buildRound: brW } = require('../scripts/merkle.cjs');
+    const dirW = path.join(ROOT, 'build', 'r7-window');
+    const putW = (start) => {
+      fs.rmSync(dirW, { recursive: true, force: true });
+      fs.mkdirSync(dirW, { recursive: true });
+      const tr = brW(0, [{ account: '0x' + '44'.repeat(20), amount: E.toString() }]);
+      fs.writeFileSync(path.join(dirW, 'round-0.json'), JSON.stringify(
+        { roundId: 0, merkleRoot: tr.root, startTime: start, count: tr.count, total: tr.total, claims: tr.claims }, null, 2));
+      fs.writeFileSync(path.join(dirW, 'rounds.json'), JSON.stringify({ rounds: [
+        { roundId: 0, merkleRoot: tr.root, startTime: start, count: tr.count, total: tr.total }] }, null, 2));
+    };
+    const srW = () => run('set-root.cjs', { RPC_URL: t.f.node.url, CHAIN_ID: '97', PRINT_ONLY: 'yes' },
+      ['--rounds', path.join(dirW, 'rounds.json'), '--round', '0']);
+    putW(latest);
+    const edge = await srW();
+    ok(edge.status === 0 && edge.out.includes('data   0x'),
+      '대조군: 시작이 정확히 claimDeadline − minClaimWindow 이면 등록된다 (7차 M-7)');
+    putW(latest + 1);
+    const over = await srW();
+    ok(over.status !== 0 && /ClaimWindowTooShort/.test(over.out) && !over.out.includes('data   0x'),
+      '시작이 claimDeadline − minClaimWindow 보다 1초라도 늦으면 calldata 를 만들지 않는다 (7차 M-7)');
+    // 경계가 컨트랙트와 같은지: 대조군 호출을 실제로 보내면 컨트랙트도 받아들인다.
+    putW(latest);
+    const live = await run('set-root.cjs', { RPC_URL: t.f.node.url, CHAIN_ID: '97', TREASURY_KEY: KEY_TREASURY },
+      ['--rounds', path.join(dirW, 'rounds.json'), '--round', '0']);
+    ok(live.status === 0, '그리고 같은 경계의 호출을 컨트랙트도 받아들인다 (스크립트와 컨트랙트의 경계 일치)');
+    fs.rmSync(dirW, { recursive: true, force: true });
+  }
+
+  console.log('\n14·15차 잔여 — set-root 는 빌드에 없는 번호로 등록된 라운드를 RoundSet 이벤트로 찾는다\n');
+  {
+    // 공개 RPC 처럼 한 요청의 블록 범위를 3으로 제한한 노드. 스크립트의 기본 범위(5000)는
+    // 거절되므로, 범위를 줄여 다시 읽지 못하면 아래 단언은 모두 실패한다.
+    clearRec();
+    // faithfulHead: 머리 블록 번호를 실제 노드처럼 돌려준다 (그래야 머리를 빠뜨리는 스캔이 드러난다).
+    // 이 노드에서는 트랜잭션 확인 대기(wait)를 쓰지 않는다: 이 하네스는 전송 즉시 채굴하고,
+    // 대기는 오지 않을 다음 블록을 기다릴 수 있다.
+    // logFailEvery: 세 번째 getLogs 마다 일시적 오류. 같은 범위를 다시 시도하지 않는 스캔은
+    // 범위 1까지 줄어든 뒤 멈춘다 (재검 F1).
+    const f = await boot({ chainId: 97, now: WALL, logRangeLimit: 3, faithfulHead: true, logFailEvery: 3 });
+    const treasury = await f.treasury.getAddress();
+    const tk = await dep('HCOWToken', f.deployer, [treasury]);
+    const t = { f, tk, token: await tk.getAddress(), treasury, chainId: 97 };
+    const claim = await realClaim(t);
+    const deployedAt = (await t.f.provider.getTransactionReceipt(t.claimTx)).blockNumber;
+    const recBase = { chainId: 97, treasury, addresses: { HCOWToken: t.token, HCOWClaim: claim } };
+    writeRec(97, recBase);
+    await t.tk.connect(t.f.treasury).transfer(claim, 10n * E);
+    // 빈 블록을 몇 개 쌓아 이벤트가 범위 3 보다 멀리 떨어지게 한다.
+    for (let i = 0; i < 4; i++) await t.tk.connect(t.f.treasury).transfer(treasury, 1n);
+    const { buildRound: brR } = require('../scripts/merkle.cjs');
+    const dirR = path.join(ROOT, 'build', 'r-roundset');
+    const start0 = WALL + 10 * DAY, start7 = WALL + 20 * DAY, start8 = WALL + 21 * DAY;
+    const t0 = brR(0, [{ account: '0x' + '44'.repeat(20), amount: E.toString() }]);
+    const t7 = brR(7, [{ account: '0x' + '47'.repeat(20), amount: (2n * E).toString() }]);
+    const t8 = brR(8, [{ account: '0x' + '48'.repeat(20), amount: (3n * E).toString() }]);
+    // 0번은 이 빌드의 라운드다. 7번 · 8번은 이 빌드 밖에서 (Safe 로 손으로 한 것처럼)
+    // 연달아 등록한다. 마지막 것이 머리 블록에 있다: 머리를 빠뜨리거나 한 칸씩 건너뛰는
+    // 스캔은 둘 중 하나를 놓친다. (자식 프로세스가 아직 이 키를 쓰지 않았으므로 nonce
+    // 캐시는 버리지 않는다. 버리면 ethers 의 250ms 캐시가 방금 쓴 nonce 를 돌려준다.)
+    const clW = new ethers.Contract(claim, art('HCOWClaim').abi, t.f.treasury);
+    const r0tx = await clW.setRoot(0, t0.root, start0);
+    const r0Block = (await t.f.provider.getTransactionReceipt(r0tx.hash)).blockNumber;
+    for (let i = 0; i < 4; i++) await t.tk.connect(t.f.treasury).transfer(treasury, 1n);
+    // 소유권을 한 번 넘긴다. 그 OwnershipTransferred 는 이전 소유자가 0 이 아니다: 생성자의
+    // 것만 시작 블록의 증거가 된다. 7번 · 8번은 새 소유자가 등록하고, 8번이 머리 블록에 온다.
+    await clW.transferOwnership(await t.f.other.getAddress());
+    const clO = new ethers.Contract(claim, art('HCOWClaim').abi, t.f.other);
+    await clO.acceptOwnership();
+    await clO.setRoot(7, t7.root, start7);
+    await clO.setRoot(8, t8.root, start8);
+    const head = Number(await t.f.provider.send('eth_blockNumber', []));
+    const put = (withOld) => {
+      fs.rmSync(dirR, { recursive: true, force: true });
+      fs.mkdirSync(dirR, { recursive: true });
+      const list = [[t0, 0, start0], ...(withOld ? [[t7, 7, start7], [t8, 8, start8]] : [])];
+      const rs = [];
+      for (const [tr, id, st] of list) {
+        const e = { roundId: id, merkleRoot: tr.root, startTime: st, count: tr.count, total: tr.total };
+        rs.push(e);
+        fs.writeFileSync(path.join(dirR, `round-${id}.json`), JSON.stringify({ ...e, claims: tr.claims }, null, 2));
+      }
+      fs.writeFileSync(path.join(dirR, 'rounds.json'), JSON.stringify({ rounds: rs }, null, 2));
+    };
+    const sr = (extra = {}) => run('set-root.cjs', { RPC_URL: t.f.node.url, CHAIN_ID: '97', PRINT_ONLY: 'yes', ...extra },
+      ['--rounds', path.join(dirR, 'rounds.json'), '--round', '0']);
+    put(false);
+    const hidden = await sr();
+    ok(hidden.status !== 0 && /round 7: root/.test(hidden.out) && /round 8: root/.test(hidden.out) &&
+       /not in .*rounds\.json/.test(hidden.out) && !hidden.out.includes('data   0x'),
+      '빌드에 없는 번호(7 · 8)로 체인에 등록된 라운드가 있으면 거부된다 (14·15차 잔여)');
+    ok(/3 registered on chain/.test(hidden.out),
+      '그리고 범위를 제한한 노드에서도 범위를 줄여 이벤트를 전부 읽었다 (머리 블록 포함)');
+    const oneByOne = await sr({ LOG_RANGE: '1' });
+    ok(/3 registered on chain/.test(oneByOne.out), 'LOG_RANGE=1 로 한 블록씩 읽어도 셋 다 찾는다 (구간 경계에서 빠지는 블록 없음)');
+    const underOnly = await sr({ ALLOW_UNDERFUNDED: 'yes' });
+    ok(underOnly.status !== 0 && /ALLOW_UNKNOWN_ROUNDS/.test(underOnly.out),
+      'ALLOW_UNDERFUNDED 로는 모르는 라운드 검사를 넘지 못한다 (자금 검사 플래그와 분리, 재검 F3)');
+    const allowed = await sr({ ALLOW_UNKNOWN_ROUNDS: 'yes' });
+    ok(allowed.status === 0 && /WARNING: 2 rounds registered on chain/.test(allowed.out) && /round 7: root/.test(allowed.out),
+      'ALLOW_UNKNOWN_ROUNDS=yes 면 경고하고 진행한다 (옛 빌드 파일을 잃은 경우의 탈출구)');
+    put(true);
+    const withIt = await sr();
+    ok(withIt.status === 0 && withIt.out.includes('data   0x') && /round 7 2/.test(withIt.out) && /round 8 3/.test(withIt.out),
+      '대조군: 7번 · 8번의 파일을 빌드에 넣으면 등록되고 그 합계를 센다');
+    // 재검 F2: 시작 블록이 틀리면 스캔이 조용히 비어 버린다. 스스로 확인한다.
+    says(await sr({ CLAIM_FROM_BLOCK: String(head + 5) }), 'past the chain head', '머리 블록보다 큰 CLAIM_FROM_BLOCK 은 거부된다');
+    const late = await sr({ CLAIM_FROM_BLOCK: String(head) });
+    ok(late.status !== 0 && /did not find the claim contract's constructor event/.test(late.out),
+      '시작 블록이 claim 배포보다 늦으면 생성자 이벤트가 없어 멈춘다 (재재검 N1)');
+    const justAfter = await sr({ CLAIM_FROM_BLOCK: String(deployedAt + 1) });
+    ok(justAfter.status !== 0 && /did not find the claim contract's constructor event/.test(justAfter.out),
+      '배포 바로 다음 블록부터여도 멈춘다: 레코드에 배포 블록이 없어도 시작 블록을 증명한다 (재재검 N1)');
+    // 일부 블록의 로그를 빠뜨리는 노드: 시작은 맞지만 이 빌드의 등록된 라운드(0번) 이벤트가 없다.
+    t.f.node.hideLogs(r0Block);
+    const gap = await sr();
+    t.f.node.showAllLogs();
+    ok(gap.status !== 0 && /The scan is\s+incomplete/.test(gap.out.replace(/\n/g, ' ')),
+      '노드가 일부 로그를 빠뜨려 이 빌드의 등록된 라운드 이벤트가 없으면 불완전하다고 멈춘다 (재검 F2)');
+    writeRec(97, { ...recBase, claim: { deployedBlock: deployedAt } });
+    const fromRec = await sr();
+    ok(fromRec.status === 0 && new RegExp(`from block ${deployedAt}, the recorded deployment block`).test(fromRec.out),
+      '대조군: 레코드의 claim.deployedBlock 부터 읽는다 (재검 F4)');
+    says(await sr({ CLAIM_FROM_BLOCK: String(deployedAt + 1) }), 'later than the block the claim was deployed in',
+      '기록된 배포 블록보다 늦은 CLAIM_FROM_BLOCK 은 거부된다 (재검 F2)');
+    writeRec(97, recBase);
+    fs.rmSync(dirR, { recursive: true, force: true });
+
+    // 메인넷에서는 시작 블록을 모르면 0 번부터 읽지 않고 멈춘다.
+    clearRec();
+    const m = await stageWall();
+    const mc = await realClaim(m);
+    const mcTx = m.claimTx;
+    mainRec(m, { addresses: { HCOWToken: m.token, HCOWClaim: mc } });
+    const dirM = path.join(ROOT, 'build', 'r-roundset-m');
+    fs.mkdirSync(dirM, { recursive: true });
+    const tm = brR(0, [{ account: '0x' + '44'.repeat(20), amount: E.toString() }]);
+    const em = { roundId: 0, merkleRoot: tm.root, startTime: TGE, count: tm.count, total: tm.total };
+    fs.writeFileSync(path.join(dirM, 'round-0.json'), JSON.stringify({ ...em, claims: tm.claims }, null, 2));
+    fs.writeFileSync(path.join(dirM, 'rounds.json'), JSON.stringify({ rounds: [em] }, null, 2));
+    const srM = (extra = {}) => run('set-root.cjs', { RPC_URL: m.f.node.url, CHAIN_ID: '56', PRINT_ONLY: 'yes', ...extra },
+      ['--rounds', path.join(dirM, 'rounds.json'), '--round', '0']);
+    says(await srM(), 'Set CLAIM_FROM_BLOCK to that block (BscScan',
+      '메인넷에서 claim 배포 블록도 배포 트랜잭션도 기록돼 있지 않으면 시작 블록을 요구한다');
+    const fromEnv = await srM({ CLAIM_FROM_BLOCK: '0' });
+    ok(/RoundSet events from block 0, CLAIM_FROM_BLOCK/.test(fromEnv.out),
+      '대조군: CLAIM_FROM_BLOCK 을 주면 그 블록부터 읽는다');
+    mainRec(m, { addresses: { HCOWToken: m.token, HCOWClaim: mc }, deploymentTxs: { HCOWClaim: mcTx } });
+    const fromTx = await srM();
+    ok(/the recorded deployment transaction/.test(fromTx.out), '대조군: 기록된 배포 트랜잭션의 영수증에서 시작 블록을 읽는다');
+    // 기록된 배포 트랜잭션이 이 claim 을 만든 것이 아니면 멈춘다.
+    const other = await realClaim(m);
+    mainRec(m, { addresses: { HCOWToken: m.token, HCOWClaim: mc }, deploymentTxs: { HCOWClaim: m.claimTx } });
+    const wrongTx = await srM();
+    ok(wrongTx.status !== 0 && wrongTx.out.toLowerCase().includes(`that transaction created ${other.toLowerCase()}`),
+      '기록된 배포 트랜잭션이 다른 컨트랙트를 만들었으면 거부된다');
+    // 영수증이 없으면 (노드가 옛 색인을 지운 경우) 레코드를 탓하지 않고 이유를 말한다.
+    mainRec(m, { addresses: { HCOWToken: m.token, HCOWClaim: mc }, deploymentTxs: { HCOWClaim: '0x' + '9'.repeat(64) } });
+    says(await srM(), 'Nodes drop old transaction indexes', '영수증이 없으면 노드의 색인 삭제를 원인으로 안내한다 (재검 F4)');
+    fs.rmSync(dirM, { recursive: true, force: true });
   }
 
   console.log('\n12차 — 코드 없는 기록 claim 을 조용히 덮어쓰지 않는다 (L-2)\n');

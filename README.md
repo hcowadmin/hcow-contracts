@@ -13,13 +13,13 @@ node compile.cjs   # solc 0.8.34 pinned, optimizer on, 200 runs, evmVersion pari
 
 node test.cjs                        # functional, token and vesting          94
 node audit.cjs                       # adversarial and property               67
-node test/HCOWClaim.test.cjs         # the sixteen tests of the claim spec   108
-node test/claim-boundaries.test.cjs  # the claim contract at its edges        82
+node test/HCOWClaim.test.cjs         # the sixteen tests of the claim spec   114
+node test/claim-boundaries.test.cjs  # the claim contract at its edges        95
 node test/build-merkle.test.cjs      # the seven tree-generator checks        31
-node test/builder-guards.test.cjs    # the generator's own guards             35
-node test/ops-guards.test.cjs        # the operator scripts, run for real    109
+node test/builder-guards.test.cjs    # the generator's own guards             85
+node test/ops-guards.test.cjs        # the operator scripts, run for real    503
 node test/HCOWAnchor.test.cjs        # the round anchor                       93
-node test/deploy-token.test.cjs      # the token-only deploy script           63
+node test/deploy-token.test.cjs      # the token-only deploy script           68
                                                                       total  682
 
 forge test         # 14 machine-searched invariants + 6 tests, 32,768 calls each
@@ -481,7 +481,10 @@ is a round that opens while the tokens funding it are still vesting.
 node scripts/build-merkle.cjs recipients.csv      --policy schedule/airdrop-policy.json      --tge <unix seconds> --out build/merkle
 ```
 
-Input is CSV or JSON with `account`, `category` and `totalAmount` in wei. Output
+Input is CSV or JSON with `account`, `category` and `totalAmount` in wei. In a
+CSV, lines starting with `#` are notes and are allowed only above the header; a
+`#` line below it stops the build, because a commented-out row is a recipient
+removed without a record (audit 7 M-9). Output
 is `build/merkle/rounds.json` — the `setRoot` arguments — and one
 `round-<n>.json` per round holding every index, amount and proof.
 
@@ -587,7 +590,9 @@ PRINT_ONLY=yes ...   # prints to / data for the Safe instead of sending
 Before anything is signed the script rebuilds the round's tree from
 `round-<n>.json` by both paths, checks the rebuilt root against both files,
 replays every shipped proof, and then checks on chain that the round has not
-already opened and that it will be funded when it opens: the claim contract's
+already opened, that it opens no later than `claimDeadline − minClaimWindow`
+(the contract would revert `ClaimWindowTooShort`; audit 7 M-7), and that it
+will be funded when it opens: the claim contract's
 balance now, plus what the sealed vesting contract will have released to it by
 the round's `startTime`. Someone has to call `release(<claim>)` on the vesting
 contract at or after that time; until then claims revert whole with
@@ -603,8 +608,21 @@ from the chain, not the file. Without that, a later round can be paid out of
 tokens an earlier round's claimants have not collected yet, and they wait.
 With no sealed vesting figure for the claim contract, the balance it holds now
 must cover every counted round that has not opened yet. (Audits 12 and 13.)
-A root registered on chain under a roundId that is not in this build cannot be
-seen: the mapping is not enumerable. The owner is a
+The mapping of rounds is not enumerable, so the script reads every `RoundSet`
+event the claim contract has emitted, from the block it was deployed in. That
+block comes from `CLAIM_FROM_BLOCK`, else `claim.deployedBlock` in the record
+(`deploy-claim.cjs` writes it), else the receipt of the recorded deployment
+transaction; on mainnet one of these is required. Nodes drop old transaction
+indexes after some weeks, which is why the block itself is recorded. The scan
+checks itself: every round of this build that is registered on chain must turn
+up in it, or it stops as incomplete. A round registered on chain under a roundId
+that is not in this build stops the run, because its total cannot be counted.
+Put its files back into the build, or set `ALLOW_UNKNOWN_ROUNDS=yes` to go ahead
+without it (a separate flag from `ALLOW_UNDERFUNDED`, so the funding checks stay
+on). Events are read `LOG_RANGE` blocks at a time (default 5000); a refused
+request is retried twice before the range is halved, and the range grows back
+after a run of successes, because public RPC endpoints limit and occasionally
+drop requests. The owner is a
 Safe, so the real call is normally `PRINT_ONLY=yes` and the printed `data`
 submitted through the Safe.
 

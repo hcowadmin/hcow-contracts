@@ -40,30 +40,63 @@ const BPS = 10_000n;
 
 // ------------------------------------------------------------------- input
 
+// 7차 감사 M-9. 이전 판은 헤더를 찾기 **전에** '#' 로 시작하는 줄을 전부 걸러냈다.
+// 그래서 수령자 행 하나를 '#' 로 주석 처리하면 오류 없이 사라졌고, 빌드는
+// "grand total exact" 를 출력했다 (합계를 남은 행들끼리 계산하므로). 스프레드시트에서
+// 행을 "잠시 빼 두는" 흔한 방식이 기록 없이 수령자를 지우는 방식이 된다.
+// 줄 번호도 걸러낸 뒤의 번호라 오류 문구가 엉뚱한 줄을 가리켰다.
+//
+// 이제 '#' 줄은 헤더 **위**에서만 허용한다 (파일 설명용). 헤더 아래의 '#' 줄은 줄 번호를
+// 대고 멈춘다. 빈 줄은 수령자가 될 수 없으므로 어디서든 건너뛴다. 줄 번호는 파일의
+// 실제 줄 번호다.
 function parseCsv(text) {
-  const lines = text.replace(/^﻿/, '').split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith('#'));
-  if (!lines.length) throw new Error('the input file has no rows');
+  const all = text.replace(/^﻿/, '').split(/\r?\n/);
+  let h = -1;
+  for (let i = 0; i < all.length; i++) {
+    const t = all[i].trim();
+    if (!t || t.startsWith('#')) continue;
+    h = i;
+    break;
+  }
+  if (h < 0) throw new Error('the input file has no rows');
 
-  const header = lines[0].split(',').map((h) => h.trim().toLowerCase());
+  const header = all[h].split(',').map((x) => x.trim().toLowerCase());
   const need = ['account', 'category', 'totalamount'];
   for (const n of need) {
     if (!header.includes(n)) {
-      throw new Error(`CSV header must contain ${need.join(', ')} — got: ${header.join(', ')}`);
+      // 머리글 줄 자체를 '#' 로 시작하면 건너뛰어지고 첫 수령자 행이 머리글로 읽힌다.
+      // 그때 "header must contain" 만 말하면 원인을 찾기 어렵다.
+      const hidden = all.slice(0, h).findIndex((l) => /^\s*#\s*account\s*,/i.test(l));
+      throw new Error(`CSV header must contain ${need.join(', ')} — got: ${header.join(', ')}` +
+        (hidden >= 0 ? `. Line ${hidden + 1} looks like the header but starts with '#', so it was read as a note.` : ''));
     }
   }
   const col = Object.fromEntries(need.map((n) => [n, header.indexOf(n)]));
 
-  return lines.slice(1).map((line, i) => {
-    const f = line.split(',').map((v) => v.trim());
-    return {
-      line: i + 2,
+  const rows = [];
+  const commented = [];
+  for (let i = h + 1; i < all.length; i++) {
+    const t = all[i].trim();
+    if (!t) continue;
+    if (t.startsWith('#')) { commented.push(i + 1); continue; }
+    const f = t.split(',').map((v) => v.trim());
+    rows.push({
+      line: i + 1,
       account: f[col.account],
       category: f[col.category],
       totalAmount: f[col.totalamount],
-    };
-  });
+    });
+  }
+  if (commented.length) {
+    throw new Error(
+      `line${commented.length > 1 ? 's' : ''} ${commented.slice(0, 10).join(', ')}` +
+      `${commented.length > 10 ? ` and ${commented.length - 10} more` : ''} ` +
+      `${commented.length > 1 ? 'start' : 'starts'} with '#' below the header. ` +
+      'A commented-out row in a recipient list is a recipient removed without a record, and the ' +
+      'totals would still come out "exact" because they are summed over what is left. Delete the ' +
+      'row if it really is out, or move notes above the header line.');
+  }
+  return rows;
 }
 
 function loadRecipients(file) {

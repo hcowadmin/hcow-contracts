@@ -438,6 +438,29 @@ function build(tamper) {
     ok(r2('95337.9') === null, '한 자리로 줄이면 통과한다 (정밀도를 낮춘 것이므로)');
   }
 
+  console.log('\n7차 M-9 — 헤더 아래의 # 줄은 수령자를 기록 없이 지운다\n');
+  {
+    const { parseCsv } = loadBuilder(null);
+    const pc = (t) => { try { return { rows: parseCsv(t) }; } catch (e) { return { err: e.message }; } };
+    const head = 'account,category,totalAmount';
+    const r1 = `${A(1)},flat,1000000000000000000`;
+    const r2 = `${A(2)},flat,2000000000000000000`;
+    // 대조군: 헤더 위의 # 줄과 빈 줄은 허용되고, 줄 번호는 파일의 실제 줄 번호다.
+    const good = pc(['# airdrop list 2026-09', '# exported from the ledger', '', head, r1, '', r2].join('\n'));
+    ok(!good.err && good.rows.length === 2, '대조군: 헤더 위의 # 줄과 빈 줄은 허용된다 (7차 M-9)');
+    ok(!good.err && good.rows[0].line === 5 && good.rows[1].line === 7,
+      '그리고 오류 문구가 쓰는 줄 번호는 파일의 실제 줄 번호다 (7차 M-9)');
+    // 헤더 아래에서 수령자 행 하나를 # 로 주석 처리하면 멈춘다.
+    const bad = pc([head, r1, `#${r2}`].join('\n'));
+    ok(!!bad.err && /line 3 starts with '#' below the header/.test(bad.err),
+      '헤더 아래 # 로 주석 처리된 수령자 행은 거부된다 (7차 M-9)');
+    const bad2 = pc([head, r1, `  # note`, r2].join('\n'));
+    ok(!!bad2.err && /line 3 starts/.test(bad2.err), '공백 뒤의 # 도 같다');
+    const hid = pc([`#${head}`, r1].join('\n'));
+    ok(!!hid.err && /Line 1 looks like the header but starts with '#'/.test(hid.err),
+      '머리글 줄을 # 로 시작하면 그 사실을 문구로 말한다');
+  }
+
   console.log(`\n${pass} passed, ${fail} failed\n`);
   process.exit(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error(e); process.exit(1); });

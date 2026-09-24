@@ -172,6 +172,182 @@ async function main() {
       'A round registered that far out never opens and its root is stuck there.');
   }
 
+  // 7차 감사 M-7. 컨트랙트는 startTime > claimDeadline − minClaimWindow 인 라운드를
+  // ClaimWindowTooShort 로 거부한다 (design note 8). 이 스크립트는 그것을 미리 보지
+  // 않았다. 위 LEAD 검사 주석이 스스로 적은 대로, 컨트랙트가 거부할 호출을 준비하는
+  // 스크립트는 검사가 없는 것보다 나쁘다: PRINT_ONLY 로 뽑은 호출이 며칠 뒤 Safe
+  // 실행에서야 되돌려지고, 그동안 라운드는 등록되지 않은 채로 남는다.
+  const [clDeadline, clWindow] = await Promise.all([claim.claimDeadline(), claim.minClaimWindow()]);
+  const latestStart = Number(clDeadline) - Number(clWindow);
+  if (tree.startTime > latestStart) {
+    throw new Error(
+      `round ${roundId} opens at ${new Date(tree.startTime * 1000).toISOString()}, but every round must open ` +
+      `at least minClaimWindow (${(Number(clWindow) / 86400).toFixed(1)} days) before claimDeadline ` +
+      `(${new Date(Number(clDeadline) * 1000).toISOString()}), so the latest start is ` +
+      `${new Date(latestStart * 1000).toISOString()}. setRoot would revert with ClaimWindowTooShort. ` +
+      'Rebuild with an earlier start, or have the owner call extendDeadline first. Nothing has been sent.');
+  }
+
+  // ---- 체인에 등록된 라운드 전부 (14·15차 감사 잔여) ------------------------
+  //
+  // 아래의 누계 검사는 rounds.json 에 있는 라운드만 센다. 라운드 매핑은 열거할 수
+  // 없으므로, 이 빌드에 없는 roundId 로 체인에 등록된 루트는 보이지 않았다. 그 루트도
+  // 같은 잔고에서 지급한다. 재빌드에서 빈 라운드가 빠지거나 Safe 로 손으로 등록한
+  // 경우가 그렇다. 유일하게 완전한 목록은 RoundSet 이벤트다. claim 이 배포된 블록부터
+  // 끝까지 읽는다. 값싼 입력 검사(LEAD · MAX_AHEAD · 창)가 모두 끝난 뒤에 돈다:
+  // 메인넷에서는 요청이 수천 번이다.
+  //
+  // 시작 블록 (재검 F2 · F4): CLAIM_FROM_BLOCK > 레코드의 claim.deployedBlock >
+  // 레코드의 배포 트랜잭션 영수증 > (메인넷 밖) 0. 메인넷에서 아무것도 없으면 멈춘다.
+  // 노드는 오래된 트랜잭션 색인을 지우므로 영수증은 배포 후 몇 주면 사라질 수 있다.
+  const recordedIsThis = recordedClaim && recordedClaim.toLowerCase() === claimAddr.toLowerCase();
+  const headBlock = Number(await provider.send('eth_blockNumber', []));
+  let recordedFrom = null;
+  if (recordedIsThis && record.claim && record.claim.deployedBlock !== undefined) {
+    recordedFrom = Number(record.claim.deployedBlock);
+    if (!Number.isInteger(recordedFrom) || recordedFrom < 0) {
+      throw new Error(`deployments/${chainId}.json claim.deployedBlock is ${JSON.stringify(record.claim.deployedBlock)}, not a block number.`);
+    }
+  }
+  let fromBlock = null;
+  let fromWhy = '';
+  if (process.env.CLAIM_FROM_BLOCK !== undefined) {
+    const raw = String(process.env.CLAIM_FROM_BLOCK).trim();
+    fromBlock = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(fromBlock)) {
+      throw new Error(`CLAIM_FROM_BLOCK must be a block number, got ${JSON.stringify(process.env.CLAIM_FROM_BLOCK)}`);
+    }
+    // 재검 F2: 오타 한 자리가 이 검사를 조용히 끈다. 머리 블록보다 크거나, 기록된
+    // 배포 블록보다 늦은 값은 받지 않는다.
+    if (fromBlock > headBlock) {
+      throw new Error(`CLAIM_FROM_BLOCK ${fromBlock} is past the chain head ${headBlock}. Nothing would be read.`);
+    }
+    if (recordedFrom !== null && fromBlock > recordedFrom) {
+      throw new Error(`CLAIM_FROM_BLOCK ${fromBlock} is later than the block the claim was deployed in (${recordedFrom}, ` +
+                      `from deployments/${chainId}.json). Events before it would be skipped.`);
+    }
+    fromWhy = 'CLAIM_FROM_BLOCK';
+  } else if (recordedFrom !== null) {
+    fromBlock = recordedFrom;
+    fromWhy = 'the recorded deployment block';
+  } else if (recordedIsThis && record.deploymentTxs?.HCOWClaim) {
+    let rc = null;
+    try { rc = await provider.getTransactionReceipt(record.deploymentTxs.HCOWClaim); } catch (_) { rc = null; }
+    if (!rc) {
+      throw new Error(
+        `this RPC returns no receipt for ${record.deploymentTxs.HCOWClaim}, the transaction deployments/${chainId}.json ` +
+        'names as deploying the claim contract. Nodes drop old transaction indexes, so this is expected some weeks ' +
+        'after deployment. Set CLAIM_FROM_BLOCK to the block the claim contract was deployed in (BscScan shows it). ' +
+        'Nothing has been sent.');
+    }
+    if (String(rc.contractAddress || '').toLowerCase() !== claimAddr.toLowerCase()) {
+      throw new Error(
+        `deployments/${chainId}.json names ${record.deploymentTxs.HCOWClaim} as the transaction that deployed ` +
+        `HCOWClaim ${claimAddr}, but that transaction created ${rc.contractAddress || 'no contract'}. The record is ` +
+        'wrong. Set CLAIM_FROM_BLOCK to the block the claim contract was deployed in. Nothing has been sent.');
+    }
+    fromBlock = Number(rc.blockNumber);
+    fromWhy = 'the recorded deployment transaction';
+  } else if (!mainnet) {
+    fromBlock = 0;
+    fromWhy = 'block 0 (no deployment block recorded; allowed off mainnet)';
+  } else {
+    throw new Error(
+      `this script reads every RoundSet event the claim contract has emitted, from the block it was deployed ` +
+      `in, and deployments/${chainId}.json records neither that block nor the deployment transaction of ` +
+      `${claimAddr}. Set CLAIM_FROM_BLOCK to that block (BscScan shows it on the contract page). Nothing has been sent.`);
+  }
+  const maxRange = Number(process.env.LOG_RANGE ?? 5000);
+  if (!Number.isInteger(maxRange) || maxRange < 1) throw new Error('LOG_RANGE must be a positive whole number of blocks');
+  const rsTopic = claim.interface.getEvent('RoundSet').topicHash;
+  // 재재검 N1 · N2: 시작 블록이 맞는지 스캔 스스로 증명한다. HCOWClaim 은 생성자에서
+  // OwnershipTransferred(0 → owner) 를 딱 한 번 낸다 (OZ Ownable. renounceOwnership 은
+  // 막혀 있고, 이후의 소유권 이전은 이전 소유자가 0 이 아니다). 그 이벤트를 같은
+  // 필터에 넣어 (요청 수는 늘지 않는다) 찾지 못하면 멈춘다. 시작 블록을 어디서
+  // 얻었든 (CLAIM_FROM_BLOCK 오타 · 틀린 레코드 · 옛 로그를 안 주는 노드) 같은 검사다.
+  const otTopic = claim.interface.getEvent('OwnershipTransferred').topicHash;
+  const zeroTopic = ethers.zeroPadValue('0x', 32);
+  const registeredIds = new Set();
+  let sawConstructor = false;
+  let requests = 0;
+  let range = maxRange;
+  // 재검 F1: 일시적 오류 한 번이 범위를 영구히 반으로 줄였고, 범위 1에서 오류가 한 번
+  // 더 나면 멈췄다. 같은 범위를 두 번 더 시도한 뒤에야 줄인다. (재재검 N3: 범위를 다시
+  // 키우던 것은 뺐다. 노드의 범위 상한 아래로 줄어든 뒤 매번 다시 부딪혀 요청을 낭비했다.)
+  for (let from = fromBlock; from <= headBlock;) {
+    const to = Math.min(from + range - 1, headBlock);
+    let logs = null;
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3 && logs === null; attempt++) {
+      try {
+        requests++;
+        logs = await provider.getLogs({ address: claimAddr, topics: [[rsTopic, otTopic]], fromBlock: from, toBlock: to });
+      } catch (e) {
+        lastErr = e;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+      }
+    }
+    if (logs === null) {
+      if (range > 1) { range = Math.max(1, Math.floor(range / 2)); continue; }
+      throw new Error(`could not read RoundSet events for block ${from}: ${lastErr.shortMessage || lastErr.message}. ` +
+                      'Nothing has been sent.');
+    }
+    for (const l of logs) {
+      if (l.topics[0] === otTopic) {
+        if (String(l.topics[1]).toLowerCase() === zeroTopic) sawConstructor = true;
+        continue;
+      }
+      registeredIds.add(claim.interface.parseLog(l).args.roundId.toString());
+    }
+    from = to + 1;
+  }
+  if (!sawConstructor) {
+    throw new Error(
+      `the scan from block ${fromBlock} (${fromWhy}) did not find the claim contract's constructor event ` +
+      `(OwnershipTransferred from the zero address). So it did not start at or before ${claimAddr} was deployed, ` +
+      'or this RPC does not serve logs that old, and its list of registered rounds cannot be trusted. Set ' +
+      'CLAIM_FROM_BLOCK to the block the claim contract was deployed in, or use an RPC with full log history. ' +
+      'Nothing has been sent.');
+  }
+  console.log(`rounds    ${registeredIds.size} registered on chain (RoundSet events from block ${fromBlock}, ` +
+              `${fromWhy}; ${requests} request${requests === 1 ? '' : 's'})`);
+  // 재검 F2: 스캔이 완전한지 스스로 확인한다. 이 빌드의 라운드 중 체인에 등록된 것은
+  // 모두 이벤트에 있어야 한다. 없으면 시작 블록이 너무 늦었거나 노드가 옛 로그를 주지
+  // 않은 것이고, 그 스캔의 "모르는 라운드 0개" 는 믿을 수 없다.
+  const missed = [];
+  for (const r of summary.rounds) {
+    const oc = await claim.rounds(r.roundId);
+    if (oc.merkleRoot !== ethers.ZeroHash && !registeredIds.has(String(r.roundId))) missed.push(r.roundId);
+  }
+  if (onchain.merkleRoot !== ethers.ZeroHash && !registeredIds.has(String(roundId)) && !missed.includes(roundId)) missed.push(roundId);
+  if (missed.length) {
+    throw new Error(
+      `round${missed.length > 1 ? 's' : ''} ${missed.join(', ')} ${missed.length > 1 ? 'are' : 'is'} registered on chain, but no ` +
+      `RoundSet event for ${missed.length > 1 ? 'them' : 'it'} was found from block ${fromBlock} (${fromWhy}). The scan is ` +
+      'incomplete: the start block is too late, or this RPC does not serve old logs. Its answer about rounds ' +
+      'outside this build cannot be trusted. Nothing has been sent.');
+  }
+  const fileIds = new Set(summary.rounds.map((r) => String(r.roundId)));
+  const unknown = [...registeredIds].filter((id) => !fileIds.has(id) && id !== String(roundId));
+  if (unknown.length) {
+    const lines = [];
+    for (const id of unknown) {
+      const oc = await claim.rounds(id);
+      lines.push(`round ${id}: root ${oc.merkleRoot}, opening ${new Date(Number(oc.startTime) * 1000).toISOString()}`);
+    }
+    const what = `registered on chain but not in ${roundsFile}:\n  ${lines.join('\n  ')}\n` +
+      'They pay out of the same balance, and without their files their totals cannot be counted. Put each ' +
+      'one\'s entry in rounds.json and its round-<n>.json back into this build (from the build that registered it).';
+    // 재검 F3: 이 탈출구는 ALLOW_UNDERFUNDED 와 따로 둔다. 옛 빌드 파일을 한 번 잃으면
+    // 이후 모든 실행에 필요해지는데, 같은 플래그면 자금 검사 둘까지 영구히 꺼진다.
+    if (!dryFlag('ALLOW_UNKNOWN_ROUNDS')) {
+      throw new Error(`${unknown.length} round${unknown.length > 1 ? 's' : ''} ${what} Or set ALLOW_UNKNOWN_ROUNDS=yes ` +
+                      'to go ahead without counting them. Nothing has been sent.');
+    }
+    console.log(`          WARNING: ${unknown.length} round${unknown.length > 1 ? 's' : ''} ${what}`);
+    console.log('          ALLOW_UNKNOWN_ROUNDS is set, so this is going ahead without counting them.');
+  }
+
   // The README says this script checks that the contract holds enough to pay
   // the round. It said that while this was a console.log. (Audit 4, H-9.)
   // Claims revert safely when underfunded, so this is a stop and not a
