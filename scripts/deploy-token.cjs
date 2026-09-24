@@ -42,7 +42,7 @@
 // deploy-claim.cjs (C-1) and fixed it there; deploy.cjs was not in scope and
 // still has the defect. A new script must not inherit it.
 
-const { connect, deploy, at, writeRecord, readRecord, dryFlag, ethers } = require('./_connect.cjs');
+const { connect, deploy, at, writeRecord, readRecord, dryFlag, ethers, suppressed, isEoaCode } = require('./_connect.cjs');
 
 const E = 10n ** 18n;
 const CANONICAL_SUPPLY = 200_000_000n * E;
@@ -94,7 +94,10 @@ async function main() {
   // does not recognise rather than reading a typo as "go ahead". See
   // _connect.cjs. Read them FIRST: a throw here must happen before anything is
   // sent, not after.
-  const dryRun = dryFlag('DRY_RUN') || dryFlag('PRINT_ONLY');
+  // 9차 감사 B-F3. 8차 L-3 은 _connect.cjs 의 suppressed() 만 고쳤다. 이 줄은
+  // 단축평가 판이라 DRY_RUN 이 참이면 PRINT_ONLY 의 오타가 검증되지 않았고,
+  // 93행 주석은 "dryFlag throws on a spelling it does not recognise" 라고 단언했다.
+  const dryRun = suppressed();
 
   const { provider, signer, net, mainnet } = await connect();
   const chainId = Number(net.chainId);
@@ -118,8 +121,22 @@ async function main() {
   // ENABLE a dangerous action: any spelling the author did not intend leaves
   // the danger switched off. That is the opposite of dryFlag above, and the
   // asymmetry is deliberate -- see the comment on dryFlag in _connect.cjs.
+  // 10차 감사. readRecord 는 이제 파일이 있으면 검증하고, 틀리면 던진다. 9차까지
+  // 이 스크립트는 레코드를 검증하지 않아서 `{}`, `{HCOWToken:""}`,
+  // `{HCOWToken:null, HCOWAnchor:<주소>}` 세 경우 모두 플래그 없이 두 번째
+  // 200,000,000 을 발행했다 (재현함). 정해진 배포 순서의 1단계가 이 스크립트다.
   const priorRecord = readRecord(chainId);
   const recorded = (priorRecord || {}).addresses?.HCOWToken;
+  // 10차 감사. REPLACE_TOKEN 은 claim 이나 베스팅이 이미 옛 토큰에 묶였으면
+  // 의미가 없다 — 둘 다 토큰 주소를 immutable 로 들고 있어서, 새 토큰을 기록하는
+  // 순간 그 둘은 어떤 파일에도 맞지 않는 채로 남는다.
+  const boundToOld = ['HCOWClaim', 'HCOWVesting'].filter((k) => (priorRecord || {}).addresses?.[k]);
+  if (recorded && boundToOld.length) {
+    throw new Error(
+      `deployments/${chainId}.json names ${boundToOld.join(' and ')}, bound immutably to the recorded ` +
+      `HCOWToken ${recorded}. Replacing the token would leave ${boundToOld.length > 1 ? 'them' : 'it'} ` +
+      'pointing at a token no file names. There is no flag for this, REPLACE_TOKEN included.');
+  }
   if (recorded && process.env.REPLACE_TOKEN !== '1') {
     throw new Error(
       `deployments/${chainId}.json already names HCOWToken at ${recorded}. Deploying again mints a ` +
@@ -128,12 +145,22 @@ async function main() {
       'holder of the old one keeps holding the old one. If you really mean to abandon that ' +
       'deployment, re-run with REPLACE_TOKEN=1.');
   }
-  if (!priorRecord && process.env.FIRST_DEPLOY !== '1' && !dryRun) {
+  // 12차 감사 M-1. 이 가드는 "레코드 파일이 있는가" 를 봤다. 그런데 파일은
+  // deploy-anchor.cjs 도 만든다. 레코드를 잃은 뒤 앵커를 처음 배포하는 운영자는
+  // FIRST_DEPLOY=1 에 정직하게 답하고(앵커는 정말 처음이다), 그 결과 생긴 앵커만
+  // 적힌 파일이 이 가드를 조용히 풀었다. 재현: 토큰·claim·베스팅이 있는 체인에서
+  // 레코드 삭제 → deploy-anchor FIRST_DEPLOY=1 → 이 스크립트가 플래그 없이 두 번째
+  // 200,000,000 을 발행했다. 질문은 "파일이 있는가" 가 아니라 "파일이 토큰을
+  // 부르는가" 다.
+  if (!recorded && process.env.FIRST_DEPLOY !== '1' && !dryRun) {
     throw new Error(
-      `deployments/${chainId}.json does not exist, so this script cannot tell whether an HCOWToken ` +
-      'is already deployed on this chain. A missing record is also what a wiped or moved file looks ' +
-      'like. If this really is the first deployment on this chain, re-run with FIRST_DEPLOY=1. If it ' +
-      'is not, restore the record first.');
+      (priorRecord
+        ? `deployments/${chainId}.json exists but names no HCOWToken, `
+        : `deployments/${chainId}.json does not exist, `) +
+      'so this script cannot tell whether an HCOWToken is already deployed on this chain. A record ' +
+      'without a token is also what a wiped file looks like after another script (deploy-anchor.cjs) ' +
+      'wrote a fresh one. If this really is the first token deployment on this chain, re-run with ' +
+      'FIRST_DEPLOY=1. If it is not, restore the record first.');
   }
 
   // ---- the treasury -----------------------------------------------------
@@ -156,10 +183,12 @@ async function main() {
   // but it has to be overridden deliberately, not by accident.
   if (mainnet) {
     const code = await provider.getCode(treasury);
-    if (code === '0x') {
+    // 10차 감사: EIP-7702 로 위임된 EOA 는 코드(0xef0100…, 23바이트)를 가진다.
+    // `code === '0x'` 만 보면 그것이 Safe 처럼 통과했다 (재현함). 위임 EOA 도 EOA 다.
+    if (isEoaCode(code)) {
       if (process.env.ALLOW_EOA_TREASURY !== '1') {
         throw new Error(
-          `TREASURY_ADDRESS ${treasury} has no code on chain ${chainId}, so it is an ordinary wallet ` +
+          `TREASURY_ADDRESS ${treasury} ${code === '0x' ? 'has no code' : 'has only an EIP-7702 delegation designator'} on chain ${chainId}, so it is an ordinary wallet ` +
           'or a Safe that has not been deployed yet. The whole supply is minted to it and it also ' +
           'owns the vesting contract, so one leaked key takes everything and one lost key locks ' +
           'everything with no recovery path. Deploy the Safe first (send it one wei so it exists on ' +
@@ -183,14 +212,39 @@ async function main() {
     expectSupply = CANONICAL_SUPPLY;
   }
   if (expectSupply !== null) console.log(`expect    ${tok(expectSupply)} HCOW total supply`);
+  // 12차 감사 M-3. EXPECT_SUPPLY 는 배포 **뒤** 에만 대조됐다. HCOWToken 은 공급량
+  // 인자가 없고 생성자에서 상수 INITIAL_SUPPLY 를 발행하므로, 새로 배포할 토큰의
+  // 공급량은 배포 전에 이미 안다. 재현: EXPECT_SUPPLY=20000000 (0 하나 빠짐) 이면
+  // 드라이런은 exit 0, 실제 실행은 토큰을 배포한 뒤 거부하고 레코드를 쓰지 않았다.
+  // 다음 실행은 FIRST_DEPLOY=1 로 또 하나를 발행한다. deploy.cjs 의 8차 H-3 ·
+  // 9차 A-2 와 같은 결함이 형제 파일에 남아 있었다 (백로그 C-13 a).
+  if (expectSupply !== null && expectSupply !== CANONICAL_SUPPLY) {
+    throw new Error(
+      `EXPECT_SUPPLY says ${tok(expectSupply)} HCOW, but HCOWToken has no supply argument: its ` +
+      `constructor always mints INITIAL_SUPPLY, ${tok(CANONICAL_SUPPLY)} HCOW. The readback after ` +
+      'deploying could never match, so the run would leave an unrecorded token on chain and stop. ' +
+      'Fix EXPECT_SUPPLY (or leave it unset). Nothing has been deployed.');
+  }
 
   // ---- dry run ----------------------------------------------------------
   if (dryRun) {
-    console.log('\nDRY RUN. Every check above passed. This is the constructor argument that would');
-    console.log('be used, and nothing has been sent or written:');
+    // 10차 감사: 배너가 "모든 검사가 통과" 라고 했지만 드라이런은 잔액 검사와
+    // 레코드 부재 가드를 건너뛴다. deploy.cjs 는 9차에 고쳤는데 여기는 아니었다.
+    const skipped = [];
+    if (bal === 0n) skipped.push('the deployer has no BNB (checked only on the live run)');
+    if (!recorded) {
+      skipped.push(`deployments/${chainId}.json ${priorRecord ? 'names no HCOWToken' : 'does not exist'}, which the LIVE run refuses unless ` +
+                   'FIRST_DEPLOY=1. If anything is already deployed on this chain, restore the record instead.');
+    }
+    console.log('\nDRY RUN. Nothing was sent and nothing was written. This is the constructor');
+    console.log('argument that would be used:');
     console.log(`  treasury  ${treasury}`);
     console.log('\nRead that address out loud against the treasury Safe before re-running. The');
     console.log('supply is minted to it in the constructor and there is no way to move it back.');
+    if (skipped.length) {
+      console.log('\nCHECKS THIS DRY RUN DID NOT MAKE:');
+      for (const w of skipped) console.log('  - ' + w);
+    }
     console.log('\nRe-run without DRY_RUN / PRINT_ONLY to deploy.');
     return;
   }

@@ -137,7 +137,7 @@ function commitments(rows) {
   };
 }
 
-function loadSchedule(file) {
+function loadSchedule(file, { allowPlaceholders = false } = {}) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
   const rows = raw.rows || raw;
   if (!Array.isArray(rows) || rows.length === 0) throw new Error(`${file} has no rows`);
@@ -147,11 +147,64 @@ function loadSchedule(file) {
     for (const k of ['beneficiary', 'total', 'tgeBps', 'cliffMonths', 'linearMonths']) {
       if (r[k] === undefined) throw new Error(`row ${i} is missing ${k}`);
     }
+    // 10차 감사. 이 함수는 키의 존재와 중복만 봤다. HCOWVesting.addSchedule 이
+    // 거부하는 행(아래)은 deploy.cjs 를 통과하고 load.cjs 에서야 걸렸다. 그때는
+    // 이미 expectedScheduleHash 와 세 개의 합계 커밋먼트가 immutable 로 박힌
+    // 뒤라, 그 베스팅은 봉인할 수 없는 채로 검증 가능한 상태로 메인넷에 남는다.
+    // 재현: tgeBps 10001, cliff 0·linear 0·bps 5000, cliff 60+linear 61 모두
+    // deploy.cjs exit 0, load.cjs revert. 그리고 commitcheck.cjs 와 vestcommit.cjs
+    // 가 둘 다 tgeBps 10001 을 받아들이고 서로 일치해서, "독립적인 두 계산" 이
+    // 같은 잘못을 함께 통과시켰다.
+    //
+    // 아래 상수는 정책 수치가 아니라 컨트랙트 상수다 (HCOWVesting.BPS,
+    // MAX_VESTING_MONTHS, uint16/uint128 인자 폭). 컨트랙트가 바뀌면 여기도 바꾼다.
+    const where = `row ${i}${r.label ? ` (${r.label})` : ''}`;
+    if (typeof r.beneficiary !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(r.beneficiary)) {
+      throw new Error(`${where}: beneficiary ${JSON.stringify(r.beneficiary)} is not an address`);
+    }
+    if (/^0x0{40}$/.test(r.beneficiary) && !allowPlaceholders) {
+      // schedule/mainnet.json 의 Airdrop 행은 의도적으로 0x0 이다. 그 자리는
+      // deploy-claim.cjs 가 배포한 HCOWClaim 주소로 채워야 하고, 그 주소는 그 전에
+      // 존재하지 않는다. 그래서 미리보기(commitcheck CLI)만 자리표시를 허용한다.
+      // 적재하거나 커밋먼트를 박는 호출자(deploy · load · seal · release)는
+      // 기본값 그대로 거부한다: addSchedule 은 ZeroAddress 로 되돌린다.
+      throw new Error(
+        `${where}: beneficiary is still the zero address placeholder. Fill it in first ` +
+        '(the Community / Airdrop row takes the HCOWClaim address deploy-claim.cjs recorded). ' +
+        'addSchedule reverts ZeroAddress on it.');
+    }
+    const intField = (k, max) => {
+      const v = r[k];
+      const n = typeof v === 'number' ? v : (/^\d+$/.test(String(v).trim()) ? Number(String(v).trim()) : NaN);
+      if (!Number.isInteger(n) || n < 0 || n > max) {
+        throw new Error(`${where}: ${k} is ${JSON.stringify(v)}; it must be an integer 0..${max}`);
+      }
+      return n;
+    };
+    const bps = intField('tgeBps', 10000);                 // HCOWVesting.BPS
+    const cliff = intField('cliffMonths', 65535);           // uint16
+    const linear = intField('linearMonths', 65535);         // uint16
+    if (cliff + linear > 120) {                              // HCOWVesting.MAX_VESTING_MONTHS
+      throw new Error(`${where}: cliff ${cliff} + linear ${linear} = ${cliff + linear} months; addSchedule reverts VestingTooLong above 120`);
+    }
+    if (cliff === 0 && linear === 0 && bps !== 10000) {
+      throw new Error(`${where}: cliff 0 and linear 0 with tgeBps ${bps}; addSchedule reverts DegenerateSchedule`);
+    }
+    if (!/^\d+$/.test(String(r.total).trim())) {
+      throw new Error(`${where}: total ${JSON.stringify(r.total)} must be an integer number of wei written as a string`);
+    }
+    const t = BigInt(String(r.total).trim());
+    if (t === 0n) throw new Error(`${where}: total is 0; addSchedule reverts ZeroAmount`);
+    if (t >= 2n ** 128n) throw new Error(`${where}: total ${t} does not fit uint128`);
+
     const key = String(r.beneficiary).toLowerCase();
     // addSchedule reverts ScheduleExists on a duplicate, which would abort the
     // load halfway with part of the table written and no way to remove rows
     // except replaceTable. Cheaper to find here.
-    if (seen.has(key)) throw new Error(`duplicate beneficiary ${r.beneficiary} at row ${i}`);
+    // 자리표시 0x0 은 미리보기에서 여러 번 나올 수 있다 (mainnet.template.json).
+    if (seen.has(key) && !(allowPlaceholders && /^0x0{40}$/.test(key))) {
+      throw new Error(`duplicate beneficiary ${r.beneficiary} at row ${i}`);
+    }
     seen.add(key);
   }
   return { meta: raw.meta || {}, rows };
@@ -161,7 +214,7 @@ module.exports = { commitments, tgeUnlockOf, vestedAt, loadSchedule, MONTH };
 
 if (require.main === module) {
   const file = process.argv[2] || path.join(__dirname, '..', 'schedule', 'testnet.json');
-  const { meta, rows } = loadSchedule(file);
+  const { meta, rows } = loadSchedule(file, { allowPlaceholders: true });
   const c = commitments(rows);
   const E = 10n ** 18n;
   const tok = (v) => (v / E).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');

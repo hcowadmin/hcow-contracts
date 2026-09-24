@@ -55,7 +55,14 @@ async function main() {
     throw new Error(`no deployment record for chain ${net.chainId}`);
   }
   const { HCOWVesting: vestingAddr, HCOWToken: tokenAddr } = rec.addresses;
-  const treasury = rec.treasury;
+  // 10차 감사: load.cjs 는 9차에 이 경우를 고쳤는데 형제인 이 파일은 아니었다.
+  // treasury 필드가 없으면 아래 toLowerCase 에서 진단 없는 TypeError 가 났다.
+  if (!rec.treasury || !ethers.isAddress(rec.treasury)) {
+    throw new Error(
+      `deployments/${net.chainId}.json has no usable "treasury" field (found ${JSON.stringify(rec.treasury)}). ` +
+      'That field is what this script compares the signing key against. Restore the record.');
+  }
+  const treasury = ethers.getAddress(rec.treasury);
 
   const from = (printOnly || dryRun) ? treasury : await signer.getAddress();
   if (from.toLowerCase() !== treasury.toLowerCase()) {
@@ -133,9 +140,12 @@ async function main() {
   ok('the treasury can cover the shortfall', treasuryBal >= shortfall,
      `holds ${tok(treasuryBal)}, needs ${tok(shortfall)}`);
 
+  // 10차 감사: 이 자리에는 `ok('TGE has not passed, or the seal is still open to
+  // the owner', true)` 가 있었다. 아무것도 확인하지 않는 검사가 "10 of 10 checks
+  // passed" 의 한 칸을 차지하고 있었다. 확인할 것이 없으므로 검사가 아니라
+  // 정보로 출력한다.
   const secondsToTge = Number(tgeTime) - Math.floor(Date.now() / 1000);
-  ok('TGE has not passed, or the seal is still open to the owner', true);
-  console.log(`        TGE ${secondsToTge > 0 ? `in ${(secondsToTge / 86400).toFixed(2)} days` : 'has passed'}; ` +
+  console.log(`  info  TGE ${secondsToTge > 0 ? `in ${(secondsToTge / 86400).toFixed(2)} days` : 'has passed'}; ` +
               `after TGE anyone may call seal(), before it only the owner may`);
 
   console.log(`\n  vesting currently holds ${tok(vestingBal)} HCOW`);
@@ -156,8 +166,13 @@ async function main() {
   await sendOrPrint('fundAndSeal()', vc, 'fundAndSeal', [], { from });
 
   if (printOnly) {
-    console.log('\nNothing was sent. Submit the two calls above from the treasury wallet,');
-    console.log('in that order, then re-run with DRY_RUN=yes to confirm the result.');
+    // 10차 감사: 이전 문구는 "DRY_RUN=yes 로 다시 돌려 확인하라" 였는데, 제대로
+    // 봉인된 뒤에 그렇게 하면 "the contract is not already sealed" 가 실패하고
+    // "Do not seal" 이 찍힌다 (재현함). 확인 도구는 release.cjs 의 보고 모드다.
+    console.log('\nNothing was sent. Submit the two calls above from the treasury wallet, in that');
+    console.log('order. Then confirm with `node scripts/release.cjs` (report only): it prints');
+    console.log('sealed true and checks the TGE unlock against the schedule. Do NOT re-run this');
+    console.log('script to confirm: once sealed, its first check is meant to fail.');
     return;
   }
 

@@ -360,6 +360,84 @@ function build(tamper) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 
+  // ======================================================================
+  // 8차 감사
+  // ======================================================================
+  console.log('\nassertBucket — linearMonths 0 으로 check 6 을 끌 수 없다 (8차 H-4)\n');
+  {
+    delete require.cache[BUILD];
+    const { buildDistribution } = require(BUILD);
+    const bad = JSON.parse(JSON.stringify(POLICY));
+    bad.bucket.linearMonths = 0;
+    let msg = '';
+    try { buildDistribution(ROWS, bad, { tgeTime: TGE }); } catch (e) { msg = e.message; }
+    ok(/linearMonths is 0 while tgeBps is 3750/.test(msg),
+      'tgeBps 가 10000 미만인데 linearMonths 가 0 이면 거부한다');
+    ok(/check 6 would pass on any tree/.test(msg), '그리고 왜 위험한지 문구가 말한다');
+    // "0" 문자열, null, undefined 도 Number() 로 0 이 된다. 같은 구멍이다.
+    for (const v of ['0', 0, null]) {
+      const b2 = JSON.parse(JSON.stringify(POLICY));
+      b2.bucket.linearMonths = v;
+      let m2 = '';
+      try { buildDistribution(ROWS, b2, { tgeTime: TGE }); } catch (e) { m2 = e.message; }
+      ok(/linearMonths/.test(m2), `linearMonths=${JSON.stringify(v)} 도 거부된다`);
+    }
+    // tgeBps 10000 이면 TGE 전액 언락이 맞고 linearMonths 는 의미가 없다.
+    const full = JSON.parse(JSON.stringify(POLICY));
+    full.bucket.linearMonths = 0;
+    full.bucket.tgeBps = 10000;
+    let okRun = true;
+    try { buildDistribution(ROWS, full, { tgeTime: TGE }); } catch (e) { okRun = e.message; }
+    ok(okRun === true, 'tgeBps 10000 + linearMonths 0 은 정당한 조합이므로 통과한다');
+    // 그리고 정상 정책은 여전히 통과한다.
+    let base = true;
+    try { buildDistribution(ROWS, POLICY, { tgeTime: TGE }); } catch (e) { base = e.message; }
+    ok(base === true, '정상 정책은 통과한다');
+  }
+
+  console.log('\ncheck 9 — 공표한 단위와 자리수 그대로 받는다 (8차 M-2)\n');
+  {
+    delete require.cache[BUILD];
+    const { buildDistribution } = require(BUILD);
+    const totalIn = BigInt(ROWS.reduce((a, r) => a + BigInt(r.totalAmount), 0n));
+    const run = (v) => {
+      try { buildDistribution(ROWS, POLICY, { tgeTime: TGE, expectTotal: v }); return null; }
+      catch (e) { return e.message; }
+    };
+    // 이 픽스처의 합계는 900,006 HCOW 로 딱 떨어진다. 실제 1차 트랜치처럼
+    // 자리수가 남는 경우를 같이 만들어 둔다.
+    ok(run(totalIn.toString()) === null, 'wei 정확일치는 통과한다');
+    ok(run('900006.00') === null, '공표 형태 900006.00 도 통과한다');
+    ok(run('900006.0') === null, '자리수를 줄인 900006.0 도 통과한다');
+    ok(/less than announced/.test(run('900006.01') || ''), '0.01 높게 공표하면 거부되고 방향을 말한다');
+    ok(/more than announced/.test(run('900005.99') || ''), '0.01 낮게 공표하면 거부되고 방향을 말한다');
+    ok(/neither an integer number of wei/.test(run('900,006.00') || ''), '천 단위 구분자는 거부된다');
+    ok(/neither an integer number of wei/.test(run('9e23') || ''), '지수 표기는 거부된다');
+    ok(/neither an integer number of wei/.test(run('-900006.00') || ''), '음수는 거부된다');
+    ok(/exact-wei comparison/.test(run('900006') || ''), '소수점 없는 900006 은 wei 로 읽히고 거부되며 그렇게 말한다');
+    // 10차 감사: 소수 정규식 끝의 `$` 를 지워도 이 스위트가 초록이었다. 그러면
+    // '900006.00e3' 이나 '900006.00.5' 가 공표 숫자로 받아들여진다.
+    ok(/neither an integer number of wei/.test(run('900006.00e3') || ''), '소수 뒤에 지수가 붙으면 거부된다 (10차)');
+    ok(/neither an integer number of wei/.test(run('900006.00.5') || ''), '소수점이 두 개면 거부된다 (10차)');
+    ok(/neither an integer number of wei/.test(run('900006.00 x') || ''), '뒤에 문자가 붙으면 거부된다 (10차)');
+
+    // 실제 1차 트랜치의 형태. 리프 단위 floor 때문에 wei 자리에 꼬리가 남고,
+    // 공표한 두 자리까지는 정확히 일치한다. 7차 판은 이 경우를 통과시킬 방법이
+    // 없었다.
+    const tail = [
+      { account: A(11), category: 'flat', totalAmount: '95337921073871118473546' },
+    ];
+    const r2 = (v) => {
+      try { buildDistribution(tail, POLICY, { tgeTime: TGE, expectTotal: v }); return null; }
+      catch (e) { return e.message; }
+    };
+    ok(r2('95337.92') === null, '꼬리가 남는 실제 합계도 공표 숫자 95337.92 로 통과한다');
+    ok(r2('95337921073871118473546') === null, '그리고 정확 wei 로도 통과한다');
+    ok(r2('95337920000000000000000') !== null, '공표 숫자를 wei 로 곱해 넣으면 거부된다 — 그게 7차 판의 상태였다');
+    ok(r2('95337.93') !== null, '한 자리 위는 거부된다');
+    ok(r2('95337.9') === null, '한 자리로 줄이면 통과한다 (정밀도를 낮춘 것이므로)');
+  }
+
   console.log(`\n${pass} passed, ${fail} failed\n`);
   process.exit(fail === 0 ? 0 : 1);
 })().catch((e) => { console.error(e); process.exit(1); });

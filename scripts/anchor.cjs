@@ -136,6 +136,17 @@ async function main() {
   const record = readRecord(chainId) || {};
   const address = process.env.ANCHOR_ADDRESS || record.addresses?.HCOWAnchor;
   if (!address) throw new Error('ANCHOR_ADDRESS must be set, or deployments/<chain>.json must name HCOWAnchor');
+  // 11차 감사: set-root.cjs 가 10차에 고친 것과 같은 모양이 여기 남아 있었다.
+  // ANCHOR_ADDRESS 가 레코드의 HCOWAnchor 와 달라도 대조 없이 진행했다 (재현함).
+  // 앵커는 공개 검증의 기준점이라, 다른 컨트랙트에 앵커하면 그 시간대의 기록이
+  // 우리가 공표한 주소 밖에 쌓인다.
+  const recordedAnchor = record.addresses?.HCOWAnchor;
+  if (process.env.ANCHOR_ADDRESS && recordedAnchor &&
+      process.env.ANCHOR_ADDRESS.toLowerCase() !== recordedAnchor.toLowerCase()) {
+    throw new Error(
+      `ANCHOR_ADDRESS ${process.env.ANCHOR_ADDRESS} but deployments/${chainId}.json records HCOWAnchor as ` +
+      `${recordedAnchor}. One of the two is wrong and this script will not pick.`);
+  }
   if ((await provider.getCode(address)) === '0x') throw new Error(`${address} has no code on chain ${chainId}`);
 
   const anchor = at('HCOWAnchor', address, signer);

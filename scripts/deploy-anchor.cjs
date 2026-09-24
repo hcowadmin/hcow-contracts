@@ -3,7 +3,12 @@
 //
 //   RPC_URL=... CHAIN_ID=97 DEPLOYER_KEY=0x... \
 //   ANCHOR_OWNER=0x<treasury Safe> ANCHOR_PUBLISHER=0x<hot key> \
-//   node scripts/deploy-anchor.cjs
+//   FIRST_DEPLOY=1 node scripts/deploy-anchor.cjs
+//
+// FIRST_DEPLOY=1 is needed exactly once, for the first anchor on a chain: from
+// audit 13 on, the script asks for it whenever deployments/<chain>.json does
+// not name an HCOWAnchor, whatever else the file names. Run with DRY_RUN=yes
+// first; the dry run does not need the flag.
 //
 // THIS ONE IS NOT ORDER-SENSITIVE
 //
@@ -29,7 +34,7 @@
 // need the new owner to accept, so a wrong owner here is recoverable while the
 // old key is still held.
 
-const { connect, deploy, at, writeRecord, readRecord, ethers, suppressed } = require('./_connect.cjs');
+const { connect, deploy, at, writeRecord, readRecord, ethers, suppressed, isEoaCode } = require('./_connect.cjs');
 
 const addr = (k) => {
   const v = process.env[k];
@@ -39,6 +44,10 @@ const addr = (k) => {
 };
 
 async function main() {
+  // 8차 감사 M-8. 억제 플래그는 가장 먼저 읽는다. 아래 재실행 가드가 이 값을
+  // 보기 때문이고, 오타로 인한 throw 도 무엇이 보내지기 전에 나야 한다.
+  const dryRun = suppressed();
+
   const { provider, signer, net, mainnet } = await connect();
   const me = await signer.getAddress();
   const bal = await provider.getBalance(me);
@@ -47,7 +56,7 @@ async function main() {
   console.log(`chain     ${chainId}${mainnet ? '  (BNB CHAIN MAINNET)' : ''}`);
   console.log(`deployer  ${me}`);
   console.log(`balance   ${ethers.formatEther(bal)} BNB\n`);
-  if (bal === 0n) throw new Error('deployer has no BNB');
+  if (bal === 0n && !dryRun) throw new Error('deployer has no BNB');
 
   // 기존 배포가 있으면 멈춘다. 덮어쓰면 anchor.cjs 가 lastPeriodStart=0 인
   // 새 컨트랙트로 옮겨가고, 과거 모든 시간을 다른 루트로 다시 앵커할 수 있게 된다.
@@ -59,13 +68,27 @@ async function main() {
   // 없으면 그것도 이상한 상태이므로 명시적 확인을 요구한다.
   const priorRecord = readRecord(chainId);
   const existing = (priorRecord || {}).addresses?.HCOWAnchor;
-  if (!priorRecord && process.env.REPLACE_ANCHOR !== '1' && process.env.FIRST_DEPLOY !== '1') {
+  // 8차 감사 M-8. `&& !dryRun` 이 없어서 깨끗한 체인에서 드라이런을 돌리면
+  // "레코드가 없다" 는 이유로 거절됐다. 드라이런의 존재 이유가 첫 배포 리허설인데
+  // 첫 배포에서만 쓸 수 없었다. deploy-token.cjs 131행에는 이 조건이 있다.
+  // 11차 감사: REPLACE_ANCHOR=1 이 이 "레코드 없음" 가드까지 풀었다. 교체
+  // 플래그는 교체를 허락할 뿐, 레코드가 없다는 사실을 설명하지 않는다.
+  // 13차 감사 M. 12차 M-1 의 거울상. 이 가드는 "파일이 있는가" 를 봤다. 레코드를
+  // 잃은 뒤 deploy-token.cjs 를 FIRST_DEPLOY=1 로 정직하게 돌리면(토큰은 정말
+  // 처음이다) 토큰만 적힌 새 파일이 생기고, 그 파일이 이 가드를 풀어 두 번째 앵커가
+  // 플래그 없이 배포됐다 (재현함). 과거 모든 시간을 다른 루트로 다시 앵커할 수 있게
+  // 되는 바로 그 경로다 (A-M4). 형제 스크립트와 같은 규칙: 파일이 앵커를 부르지
+  // 않으면 FIRST_DEPLOY=1. 정상적인 첫 앵커 배포도 이 플래그를 한 번 요구한다.
+  if (!existing && process.env.FIRST_DEPLOY !== '1' && !dryRun) {
     throw new Error(
-      `deployments/${chainId}.json does not exist, so this script cannot tell whether an ` +
-      'HCOWAnchor is already deployed on this chain. A missing record is also what a wiped or ' +
-      'moved file looks like, and deploying over a live anchor moves the hourly job to a fresh ' +
-      'contract whose lastPeriodStart is 0. If this really is the first deployment on this chain, ' +
-      're-run with FIRST_DEPLOY=1. If it is not, restore the record first.');
+      (priorRecord
+        ? `deployments/${chainId}.json exists but names no HCOWAnchor, `
+        : `deployments/${chainId}.json does not exist, `) +
+      'so this script cannot tell whether an HCOWAnchor is already deployed on this chain. A record ' +
+      'without an anchor is also what a wiped file looks like after another script wrote a fresh ' +
+      'one, and deploying over a live anchor moves the hourly job to a fresh contract whose ' +
+      'lastPeriodStart is 0. If this really is the first anchor on this chain, re-run with ' +
+      'FIRST_DEPLOY=1. If it is not, restore the record first.');
   }
   if (existing && process.env.REPLACE_ANCHOR !== '1') {
     throw new Error(
@@ -88,8 +111,9 @@ async function main() {
   }
 
   const ownerCode = await provider.getCode(owner);
-  console.log(`owner     ${owner}  ${ownerCode === '0x' ? 'EOA' : `contract, ${(ownerCode.length - 2) / 2} bytes of code`}`);
-  if (mainnet && ownerCode === '0x') {
+  // 10차 감사: EIP-7702 위임 EOA 는 코드를 가진다. 그래도 EOA 다.
+  console.log(`owner     ${owner}  ${isEoaCode(ownerCode) ? 'EOA' : `contract, ${(ownerCode.length - 2) / 2} bytes of code`}`);
+  if (mainnet && isEoaCode(ownerCode)) {
     console.log('          WARNING: this is an EOA. The owner rotates the publisher key and belongs in the Safe.');
   }
   if (mainnet && owner.toLowerCase() === me.toLowerCase()) {
@@ -102,8 +126,8 @@ async function main() {
   }
 
   const pubCode = await provider.getCode(publisher);
-  console.log(`publisher ${publisher}  ${pubCode === '0x' ? 'EOA' : 'contract'}`);
-  if (pubCode !== '0x') {
+  console.log(`publisher ${publisher}  ${isEoaCode(pubCode) ? 'EOA' : 'contract'}`);
+  if (!isEoaCode(pubCode)) {
     console.log('          NOTE: a contract publisher must be able to call anchor(); an EOA is the expected case.');
   }
   const pubBal = await provider.getBalance(publisher);
@@ -117,11 +141,25 @@ async function main() {
   // 무시되고 실제 배포가 나갔다. deploy-token.cjs 헤더가 "새 스크립트는 이
   // 결함을 물려받으면 안 된다" 고 적어둔 바로 그 결함이다. 여기는 모든 검사가
   // 끝난 지점이므로, 드라이런은 "전부 통과했고 이 인자로 배포한다" 를 보여준다.
-  if (suppressed()) {
-    console.log('\nDRY RUN. Every check above passed. These are the constructor arguments that');
-    console.log('would be used, and nothing has been sent or written:');
+  if (dryRun) {
+    // 10차 감사: 배너가 "Every check above passed" 라고 했지만 드라이런은 잔액
+    // 검사와 레코드 부재 가드를 건너뛴다.
+    const skipped = [];
+    if (bal === 0n) skipped.push('the deployer has no BNB (checked only on the live run)');
+    if (!existing) {
+      // 14차 감사 L-2: 문구가 실제 거부 문구와 같은 질문을 던지게 한다.
+      skipped.push(`deployments/${chainId}.json ${priorRecord ? 'names no HCOWAnchor' : 'does not exist'}, which the LIVE run refuses unless ` +
+                   'FIRST_DEPLOY=1. Set it only if this really is the first anchor on this chain; if an anchor ' +
+                   'was deployed before, restore its address to the record instead.');
+    }
+    console.log('\nDRY RUN. Nothing has been sent or written. These are the constructor arguments');
+    console.log('that would be used:');
     console.log(`  owner      ${owner}`);
     console.log(`  publisher  ${publisher}`);
+    if (skipped.length) {
+      console.log('\nCHECKS THIS DRY RUN DID NOT MAKE:');
+      for (const w of skipped) console.log('  - ' + w);
+    }
     console.log('\nRe-run without DRY_RUN / PRINT_ONLY to deploy.');
     return;
   }
@@ -153,6 +191,10 @@ async function main() {
   }
 
   const record = readRecord(chainId) || {};
+  // 9차 감사 A-7. 이 스크립트는 레코드를 처음 만들 때 chainId 를 쓰지 않았고,
+  // 그래서 deploy.cjs 의 chainId 교차검사가 "앵커만 적힌 레코드" 에서 정확히
+  // 침묵했다 — 다른 체인에서 복사해 온 파일이 바로 그 형태다.
+  record.chainId = chainId;
   record.addresses = { ...(record.addresses || {}), HCOWAnchor: address };
   writeRecord(chainId, record);
   console.log(`\nrecorded in deployments/${chainId}.json`);

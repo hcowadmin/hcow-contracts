@@ -20,8 +20,8 @@ async function dep(name, signer, args) {
   return c;
 }
 
-async function boot({ chainId = 56, now = 1900000000 } = {}) {
-  const node = await makeNode({ chainId, now });
+async function boot({ chainId = 56, now = 1900000000, balances = {}, harnessMarker = true } = {}) {
+  const node = await makeNode({ chainId, now, balances, harnessMarker });
   const provider = new ethers.JsonRpcProvider(node.url, undefined, { staticNetwork: true });
   const deployer = new ethers.NonceManager(new ethers.Wallet(KEY_DEPLOY, provider));
   const treasury = new ethers.NonceManager(new ethers.Wallet(KEY_TREASURY, provider));

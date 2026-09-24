@@ -204,8 +204,12 @@ contract HCOWClaim is Ownable2Step, ReentrancyGuard {
     ///         whole of it in round one. This exists so that the other answer
     ///         remains available without a redeploy.
     ///
-    ///         It can be raised only while no round has opened. Afterwards it
-    ///         moves down and never up. See setMinClaimAmount.
+    ///         It can be raised only while no round has been REGISTERED.
+    ///         Afterwards it moves down and never up. See setMinClaimAmount.
+    ///         (Audit 8 found this line, the NatSpec on setMinClaimAmount and
+    ///         two places in README.md all still saying "opened" while the code
+    ///         said "registered". Three stale copies of one rule is the same
+    ///         shape as the sweep()-versus-note-4 contradiction audit 7 found.)
     uint256 public minClaimAmount;
 
     /// @notice The earliest startTime ever given to any round, or
@@ -454,15 +458,24 @@ contract HCOWClaim is Ownable2Step, ReentrancyGuard {
     /**
      * @notice Set the per-entry floor. Zero means no floor.
      *
-     * @dev The floor may be raised only before the first round opens. Once any
-     *      round has opened it moves downwards only, and a raise reverts
-     *      permanently.
+     * @dev The floor may be raised only while NO round has been registered yet.
+     *      From the first setRoot onwards it moves downwards only, and a raise
+     *      reverts permanently with MinClaimAmountRaiseClosed.
+     *
+     *      The gate is registration, not opening. A round's recipients and
+     *      amounts are fixed and published by setRoot and the round opens
+     *      minRoundNotice later; a gate at opening would leave that whole
+     *      interval open to a zero-notice raise that excluded leaves already
+     *      committed. Audit 7 (2026-09-22) reproduced it. Audit 8 found this
+     *      NatSpec still describing the old rule while the code implemented the
+     *      new one, which matters because this text is what ends up in the ABI
+     *      and on BscScan.
      *
      *      Every other power the owner holds here runs one way: the deadline
      *      extends and never shortens, an open round's root is frozen,
      *      ownership cannot be renounced. This one was the exception, and a
-     *      floor raised after a round has opened excludes exactly the small
-     *      recipients the floor was meant to spare gas. That is the same act as
+     *      floor raised after a round has been registered excludes exactly the
+     *      small recipients the floor was meant to spare gas. That is the same act as
      *      shortening the deadline, reached by a different route, and design
      *      note 4 says why this project cannot hold that shape.
      *

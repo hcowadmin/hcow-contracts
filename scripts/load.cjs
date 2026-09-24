@@ -21,34 +21,63 @@
 // half built.
 
 const path = require('path');
-const { connect, at, readRecord, sendOrPrint, ethers, dryFlag } = require('./_connect.cjs');
+const { connect, at, readRecord, sendOrPrint, ethers, suppressed } = require('./_connect.cjs');
 const { loadSchedule } = require('./commitcheck.cjs');
 const { commitments } = require('../vestcommit.cjs');
 
 async function main() {
-  const printOnly = dryFlag('PRINT_ONLY');
+  // 8차 감사 M-10. 이 스크립트는 PRINT_ONLY 만 알았다. 7차 조치로 sendOrPrint 가
+  // 두 이름을 모두 이해하게 됐으므로, DRY_RUN=yes 는 전송만 막고 그 뒤 되읽기에서
+  // "9명을 기대했는데 체인은 0" 이라는 엉뚱한 실패를 냈다. 위험하진 않지만
+  // "두 이름은 어디서나 같은 뜻" 이라는 7차 조치의 약속이 깨져 있었다.
+  const printOnly = suppressed();
   const { provider, signer, net, mainnet } = await connect({
     needSigner: !printOnly, keyVar: 'TREASURY_KEY',
   });
 
   const rec = readRecord(Number(net.chainId));
   if (!rec || !rec.addresses || !rec.addresses.HCOWVesting) {
-    throw new Error(`no deployment record for chain ${net.chainId}. Run scripts/deploy.cjs first.`);
+    // 11차 감사: 파일이 있는데 베스팅만 없을 때도 "no deployment record" 라고 했다.
+    throw new Error(
+      rec ? `deployments/${net.chainId}.json names no HCOWVesting yet. Run scripts/deploy.cjs first.`
+          : `no deployment record for chain ${net.chainId}. Run scripts/deploy.cjs first.`);
   }
   const vestingAddr = rec.addresses.HCOWVesting;
-  const treasury = rec.treasury;
-
-  const from = printOnly ? treasury : await signer.getAddress();
-  if (from.toLowerCase() !== treasury.toLowerCase()) {
+  // 9차 감사 B-F7. rec.treasury 가 없으면 아래 toLowerCase 에서 진단 없는
+  // TypeError 가 났다. 무엇이 없는지 말한다.
+  if (!rec.treasury || !ethers.isAddress(rec.treasury)) {
     throw new Error(
-      `TREASURY_KEY is ${from} but the deployment records the treasury and owner ` +
-      `as ${treasury}. addSchedules is owner-only; this key cannot load the table.`);
+      `deployments/${net.chainId}.json has no usable "treasury" field (found ${JSON.stringify(rec.treasury)}). ` +
+      'That field is what this script compares the signing key against. Restore the record.');
   }
+  const treasury = ethers.getAddress(rec.treasury);
 
   const vc = at('HCOWVesting', vestingAddr, printOnly ? provider : signer);
+  // 9차 감사 B-F6. 이전 판은 owner 를 레코드에서 읽어 "owner" 라고 라벨링해 찍고,
+  // 그 주소에서 서명하라고 지시했다. vc.owner() 를 한 번도 부르지 않았다.
+  // 재현 확인: 레코드의 treasury 필드만 오염시키면 PRINT_ONLY 가 그 주소를 owner
+  // 로 출력하고 exit 0 이었다 — Safe 에서 제출하면 OwnableUnauthorizedAccount 로
+  // revert 한다. seal.cjs 는 처음부터 체인에서 읽어 대조했고, set-root.cjs 는
+  // 8차에 그렇게 바뀌었다. 같은 원칙을 여기에도 적용한다. 체인이 근거다.
+  const onChainOwner = await vc.owner();
+  if (onChainOwner.toLowerCase() !== treasury.toLowerCase()) {
+    throw new Error(
+      `the vesting contract at ${vestingAddr} reports owner ${onChainOwner}, but ` +
+      `deployments/${net.chainId}.json records the treasury as ${treasury}. One of the two is wrong. ` +
+      'addSchedules is owner-only, so a call built against the recorded value would revert with ' +
+      'OwnableUnauthorizedAccount. This script will not print a call it knows cannot land.');
+  }
+
+  const from = printOnly ? onChainOwner : await signer.getAddress();
+  if (from.toLowerCase() !== onChainOwner.toLowerCase()) {
+    throw new Error(
+      `TREASURY_KEY is ${from} but the vesting contract's owner is ` +
+      `${onChainOwner}. addSchedules is owner-only; this key cannot load the table.`);
+  }
+
   console.log(`chain     ${net.chainId}${mainnet ? '  (BNB CHAIN MAINNET)' : ''}`);
   console.log(`vesting   ${vestingAddr}`);
-  console.log(`owner     ${treasury}\n`);
+  console.log(`owner     ${onChainOwner}  (read from the chain)\n`);
 
   if (await vc.sealed_()) throw new Error('this contract is already sealed. Nothing can be loaded.');
   const already = await vc.beneficiaryCount();
@@ -115,7 +144,11 @@ async function main() {
 
   if (printOnly) {
     console.log('\nNothing was sent. Submit the call above from the treasury wallet,');
-    console.log('then re-run this script without PRINT_ONLY to verify the result.');
+    // 11차 감사: 이전 안내("PRINT_ONLY 없이 다시 돌려 확인하라")는 Safe 트레저리에서
+    // 실행할 수 없었다 — 키가 없고, PRINT_ONLY 로 돌리면 이미 적재돼 거부된다.
+    // 행 단위 대조는 seal.cjs 의 드라이런이 한다.
+    console.log('then confirm with `DRY_RUN=yes node scripts/seal.cjs`: it compares every row on chain');
+    console.log('with the file and checks the commitments, without sending anything.');
     return;
   }
 

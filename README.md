@@ -400,7 +400,7 @@ one contract serves every unlock round of every airdrop category.
 | One claim per round per entry | Per-round bitmap. Rounds share nothing, so a claimed round 0 does not close round 1 |
 | A failed transfer never marks an entry claimed | The balance is checked first and the entry is marked before the transfer, so an underfunded round reverts whole with `InsufficientBalance` and the bit is rolled back with it. This is the standard permanent-loss bug in multi-round distributors, and test 9 is the one that proves it is absent |
 | `sweep` is shut until `claimDeadline`, with no override | But it is **not** the owner's only route to the tokens, and this table used to say it was. `setRoot` is the second route: the owner can register an unused round whose tree pays one address the balance, wait out `minRoundNotice`, and claim it. That is a property of every distributor whose operator chooses the root, and design note 4 in the contract sets out what is enforced instead. Do not read this row as more than it says |
-| The deadline extends, never shortens, and not past the horizon | `extendDeadline` refuses anything at or below the current value, and anything more than `MAX_DEADLINE_HORIZON` from the calling block. Unbounded, it could be pushed out of reach and — since `setRoot`'s upper bound is derived from it — take a registered round with it, leaving the balance neither claimable nor sweepable (audit 7) |
+| The deadline extends, never shortens, and not past the horizon | `extendDeadline` refuses anything at or below the current value, and anything more than `MAX_DEADLINE_HORIZON` (3650 days) from the calling block. Unbounded, one call could have pushed it out of reach and — since `setRoot`'s upper bound is derived from it — taken a registered round with it, leaving the balance neither claimable nor sweepable (audit 7). The bound ends the one-shot version of that, **not every version**: an owner who keeps acting can pair `extendDeadline` with a `setRoot` that pushes the round later and repeat roughly every 9.7 years, holding the balance in the same state for as long as they keep doing it. Design note 8 in the contract states this; do not read this row as saying more than the bound actually buys, which is that the state now requires a live owner rather than a single transaction |
 | `minClaimAmount` is raised only before the first round is **registered** | Afterwards it moves down and never up, reverting with `MinClaimAmountRaiseClosed`. The gate used to be the first round *opening*, which left the whole `minRoundNotice` interval — after the list is fixed and published, before anyone can claim — open to a zero-notice raise that excluded committed leaves. Audit 7 reproduced it and the gate moved back to registration |
 | Ownership cannot be renounced | Renouncing would end `setRoot` too, so no later round could ever open and everything still owed would be stranded |
 | No unlock policy is in the contract | It knows only "may this address take this amount in this round". Ratios live in the tree |
@@ -443,14 +443,23 @@ this contract does not provide.
 zero, meaning no floor, and is the parameter left for spec section 10 item 2.
 
 Every power the owner holds here runs one way once claiming has begun, and the
-floor is no exception: it can be raised only while `block.timestamp` is still
-before `earliestRoundStart`, the earliest start time ever given to any round.
+floor is no exception: it can be raised only while **no round has been
+registered at all**, that is while `earliestRoundStart` is still its initial
+`type(uint256).max`. The first `setRoot` closes it, permanently, whether or not
+that round has opened.
+
+The gate used to be the first round *opening*, which left the whole
+`minRoundNotice` interval — after the list is fixed and published, before anyone
+can claim — open to a zero-notice raise that excluded committed leaves. Audit 7
+(2026-09-22) reproduced that and the gate moved back to registration. Audit 8
+found this paragraph still describing the old rule.
+
 `earliestRoundStart` only ever moves earlier. It does not follow an unopened
 round that `setRoot` pushes later — the rounds mapping is sparse and cannot be
 enumerated, and recomputing a true minimum would mean carrying a list of every
-round for the sake of one owner-only call. The consequence is that the window
-for raising the floor can close earlier than the first round actually opens,
-never later, which is the only direction it is safe to be wrong in.
+round for the sake of one owner-only call. That asymmetry no longer affects the
+floor gate, which keys off registration rather than off the value, but the value
+is still what the revert reports.
 
 ### Unlock policy is not in the contract, and must not be
 
@@ -511,14 +520,31 @@ zero and unused.
 This extends the list above; steps 1-3 there are unchanged.
 
 ```
-1  Deploy HCOWClaim (owner = treasury Safe, claimDeadline set deliberately)
-2  Point HCOWVesting's Community/Airdrop schedule at the HCOWClaim address
-3  fundAndSeal()
-4  After TGE, release the bucket so tokens arrive at HCOWClaim
-5  Register round 0's root (setRoot)
-6  Open the claim page
-7  Repeat step 5 for each later round
+1  deploy-token.cjs      HCOWToken, supply minted to the treasury Safe
+2  deploy-claim.cjs      HCOWClaim (owner = treasury Safe, claimDeadline set long)
+3  Put the HCOWClaim address in the Community / Airdrop row, and in no other row
+4  deploy.cjs            HCOWVesting, with HCOW_ADDRESS. Mainnet refuses without a recorded
+                         HCOWClaim, if the claim is not the Airdrop row's beneficiary, if the
+                         table's total or TGE unlock differs from the file's own published
+                         figures (meta.totalsMustEqual / meta.tgeUnlockMustEqual), or if the
+                         Airdrop row finishes vesting after claimDeadline − minClaimWindow
+5  load.cjs, seal.cjs    PRINT_ONLY for the Safe; confirm with DRY_RUN=yes seal.cjs
+6  set-root.cjs round 0  BEFORE TGE by at least max(1 day, minRoundNotice). Round 0 pays at
+                         TGE, so it must be registered ahead of it. set-root counts what the
+                         sealed vesting will release to the claim by the round's start, so no
+                         ALLOW_UNDERFUNDED is needed for it
+7  At or after TGE       release.cjs RELEASE=yes, so the Airdrop tokens arrive at HCOWClaim
+8  Open the claim page
+9  set-root.cjs for each later round, each at least minRoundNotice ahead
 ```
+
+The order used to say "after TGE, release the bucket; then register round 0".
+Audit 11 (2026-09-23) ran it end to end: round 0 cannot be registered after
+TGE, because `minRoundNotice` requires it to be registered before its start,
+and its start is TGE. It could only be registered before TGE with
+`ALLOW_UNDERFUNDED=yes`, which meant the underfunding guard never ran for the
+one round every public promise depends on. Both the order and the guard were
+corrected.
 
 ```bash
 RPC_URL=... CHAIN_ID=97 DEPLOYER_KEY=0x... HCOW_ADDRESS=0x... \
@@ -539,17 +565,14 @@ so the command above used to fail on a missing variable when copied.
 The one-hour floors exist so a testnet rehearsal fits in an afternoon. The
 script refuses both of them on mainnet.
 
-**Step 2 is the point of no return.** `seal()` fixes every beneficiary forever,
-so `HCOWClaim` has to exist and be final before sealing. Deploy it before
-`scripts/load.cjs` runs, not between loading and sealing. `deploy-claim.cjs`
-reads `sealed_()` and refuses to deploy against an already-sealed vesting
-contract, because a claim contract deployed after the seal looks correct,
-verifies on BscScan, and silently never receives a token. **That check is
-conditional, not unconditional**: it needs `deployments/<chain>.json` to name
-`HCOWVesting`, and in the deployment order this repository actually uses the
-claim contract is deployed before vesting exists. Then the script prints
-`vesting not recorded for this chain; cannot check whether it is sealed` and
-proceeds. Read that line when it appears; it means this guard did not run.
+**Step 4 is the point of no return, not the seal.** The beneficiary set is
+fixed when HCOWVesting is **deployed**: `expectedScheduleHash` is immutable
+and contains all nine addresses. So `HCOWClaim` has to exist and be final
+before `deploy.cjs` runs. `deploy-claim.cjs` refuses to deploy whenever any
+HCOWVesting is recorded, sealed or not, with no flag to override it, because a
+claim contract deployed after the vesting looks correct, verifies on BscScan,
+and silently never receives a token. (Until audit 10 it read only `sealed_()`,
+and this paragraph described the seal as the point of no return.)
 
 `claimDeadline` is passed here and can only ever move later. Set it long.
 
@@ -564,7 +587,24 @@ PRINT_ONLY=yes ...   # prints to / data for the Safe instead of sending
 Before anything is signed the script rebuilds the round's tree from
 `round-<n>.json` by both paths, checks the rebuilt root against both files,
 replays every shipped proof, and then checks on chain that the round has not
-already opened and that the contract holds enough to pay it. The owner is a
+already opened and that it will be funded when it opens: the claim contract's
+balance now, plus what the sealed vesting contract will have released to it by
+the round's `startTime`. Someone has to call `release(<claim>)` on the vesting
+contract at or after that time; until then claims revert whole with
+`InsufficientBalance` and nothing is lost.
+
+All rounds share one balance, so the round is not checked alone. Every round in
+`rounds.json` that opens no later than this one (registered, or still able to
+be) is added up, registered roots are checked against the chain, and the total
+must not exceed what the vesting will have released to the claim contract by
+this round's start. The same sum is checked again at the start of every round
+already registered to open later, and a registered round's start time is read
+from the chain, not the file. Without that, a later round can be paid out of
+tokens an earlier round's claimants have not collected yet, and they wait.
+With no sealed vesting figure for the claim contract, the balance it holds now
+must cover every counted round that has not opened yet. (Audits 12 and 13.)
+A root registered on chain under a roundId that is not in this build cannot be
+seen: the mapping is not enumerable. The owner is a
 Safe, so the real call is normally `PRINT_ONLY=yes` and the printed `data`
 submitted through the Safe.
 
@@ -631,7 +671,7 @@ and nothing but a test holds them together.
 | Beneficiary cap | `MAX_BENEFICIARIES` is 200. The published allocation uses nine |
 | Rescue recipient | Constructor argument, fixed forever. Where a foreign token sent here by mistake goes. Not the deployer by default; decide it deliberately |
 | Airdrop category totals | Per-category sums for miniapp / TaskOn / awareness / build-phase / other. Check 6 of the generator refuses a set that outruns the bucket's release curve, but it cannot tell you the right numbers |
-| `minClaimAmount` | Contract parameter, starts at zero meaning no floor. Dust is handled in the tree instead; this is the second option, left open. Decide it before the first round opens: after that it can only be lowered |
+| `minClaimAmount` | Contract parameter, starts at zero meaning no floor. Dust is handled in the tree instead; this is the second option, left open. Decide it **before the first `setRoot`**: from the first round *registration* onwards it can only be lowered. Also cross-check it against the tree — check 8 of the generator refuses a build whose smallest leaf is under the floor, and with the real first tranche the smallest leaf is 0.4248 HCOW |
 | `claimDeadline` | Constructor argument. Extends, never shortens, so set it long |
 | Sweep recipient | An argument to `sweep`, chosen per call rather than fixed at deployment. Decide it before the deadline, not on the day |
 | Referral commission | Whether the 1% belongs to "miniapp rewards" or is its own category. It changes the curve applied to those balances |

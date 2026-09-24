@@ -23,8 +23,34 @@ const says = (r, needle, m) => {
     r.out.split('\n').map((l) => '        | ' + l).join('\n'));
 };
 
-const recPath = (c) => path.join(ROOT, 'deployments', `${c}.json`);
-const clearRec = () => fs.rmSync(path.join(ROOT, 'deployments'), { recursive: true, force: true });
+// 10차 감사. 이 스위트는 ROOT/deployments 를 통째로 지우고 가짜 chainId 56
+// 레코드를 써 왔다. 그 경로는 _connect.cjs 가 운영 레코드를 두는 곳과 같다.
+// 운영자가 실제 체크아웃에서 `npm test` 를 돌리면 메인넷 레코드가 지워지고,
+// 중간에 끊기면 하네스 주소가 적힌 가짜 메인넷 레코드가 남았다 (재현함).
+// 이제 스위트 전용 디렉터리를 쓰고, 자식 프로세스도 HCOW_RECORD_DIR 로 같은
+// 곳을 본다. run() 이 process.env 를 넘기므로 여기서 한 번 정하면 된다.
+const REC_DIR = path.join(ROOT, 'build', 'test-deployments', 'deploy-token');
+process.env.HCOW_RECORD_DIR = REC_DIR;
+// (11차 감사: 상수 두 개를 비교하던 "refusing to run" 검사를 지웠다. 절대 발동하지 않았다.)
+// 운영 레코드 디렉터리의 지문. 끝에서 바뀌지 않았는지 본다 (ops-guards 와 같은 방식).
+function snapshotDir(dir) {
+  if (!fs.existsSync(dir)) return null;
+  const out = [];
+  const walk = (d) => {
+    for (const n of fs.readdirSync(d).sort()) {
+      const p = path.join(d, n);
+      const st = fs.statSync(p);
+      if (st.isDirectory()) { out.push(`${path.relative(dir, p)}/`); walk(p); }
+      else out.push(`${path.relative(dir, p)}:${st.size}:${st.mtimeMs}:` +
+        require('crypto').createHash('sha256').update(fs.readFileSync(p)).digest('hex'));
+    }
+  };
+  walk(dir);
+  return out.join('\n');
+}
+const REAL_DEPLOYMENTS_AT_START = snapshotDir(path.join(ROOT, 'deployments'));
+const recPath = (c) => path.join(REC_DIR, `${c}.json`);
+const clearRec = () => fs.rmSync(REC_DIR, { recursive: true, force: true });
 const readRec = (c) => JSON.parse(fs.readFileSync(recPath(c), 'utf8'));
 const writeRec = (c, o) => {
   fs.mkdirSync(path.dirname(recPath(c)), { recursive: true });
@@ -77,8 +103,20 @@ const env = (s, extra = {}) => ({
     says(r1, 'FIRST_DEPLOY=1', 'no record and no FIRST_DEPLOY refuses, naming the flag');
     ok(!hasRec(56), 'the refusal deployed nothing');
 
+    // 12차 감사 M-1. 앵커만 적힌 레코드(레코드를 잃은 뒤 deploy-anchor.cjs 가 새로
+    // 쓴 파일의 모양)는 "처음이 아니다" 의 증거가 아니다. 이전 판은 이 파일 하나로
+    // 플래그 없이 두 번째 200,000,000 을 발행했다.
+    writeRec(56, { chainId: 56, addresses: { HCOWAnchor: '0x' + 'a1'.repeat(20) } });
+    const bA = Number(await s.f.provider.send('eth_blockNumber', []));
+    const rA = await run('deploy-token.cjs', env(s));
+    says(rA, 'names no HCOWToken', '앵커만 적힌 레코드로는 FIRST_DEPLOY 없이 토큰을 발행하지 않는다 (12차)');
+    ok(bA === Number(await s.f.provider.send('eth_blockNumber', [])) && !readRec(56).addresses.HCOWToken,
+      '그리고 아무것도 배포되거나 기록되지 않았다 (12차)');
+
+    // 대조군: 같은 앵커만 적힌 레코드에서 FIRST_DEPLOY=1 은 배포하고 앵커를 보존한다.
     const r2 = await run('deploy-token.cjs', env(s, { FIRST_DEPLOY: '1' }));
     ok(r2.status === 0, 'FIRST_DEPLOY=1 deploys');
+    ok(readRec(56).addresses.HCOWAnchor === '0x' + 'a1'.repeat(20), '그리고 레코드의 앵커를 그대로 둔다 (12차)');
     const first = readRec(56).addresses.HCOWToken;
     ok(!!first && ethers.isAddress(first), 'the record names HCOWToken');
 
@@ -147,10 +185,16 @@ const env = (s, extra = {}) => ({
 
     clearRec();
     const s2 = await stage({ chainId: 97 });
+    // 12차 감사 M-3. 이전 판은 이 경우를 배포 **뒤** 에 잡았다 (단언도 그렇게 적혀
+    // 있었다: "DOES NOT READ BACK AS EXPECTED"). 즉 이 테스트는 고아 토큰이 체인에
+    // 남는 동작을 정상으로 고정하고 있었다. 이제 배포 전에 거부되고 블록이 늘지 않는다.
+    const b2 = Number(await s2.f.provider.send('eth_blockNumber', []));
     const r2 = await run('deploy-token.cjs', env(s2, { FIRST_DEPLOY: '1', EXPECT_SUPPLY: '199999999' }));
-    says(r2, 'DOES NOT READ BACK AS EXPECTED', 'a supply one token out is caught');
-    says(r2, 'is NOT written to the record', 'and the failure says the address was not recorded');
-    ok(!hasRec(97), 'a token that fails readback is not recorded');
+    says(r2, 'has no supply argument', 'a supply one token out is caught before deploying (12차)');
+    ok(b2 === Number(await s2.f.provider.send('eth_blockNumber', [])), 'and no token was deployed for it (12차)');
+    ok(!hasRec(97), 'and nothing is recorded');
+    const r2d = await run('deploy-token.cjs', env(s2, { FIRST_DEPLOY: '1', EXPECT_SUPPLY: '20000000', DRY_RUN: 'yes' }));
+    says(r2d, 'has no supply argument', 'the dry run refuses a wrong EXPECT_SUPPLY too (12차)');
 
     clearRec();
     const s3 = await stage({ chainId: 97 });
@@ -161,7 +205,7 @@ const env = (s, extra = {}) => ({
     const s4 = await stage({ chainId: 97 });
     const r4 = await run('deploy-token.cjs',
       env(s4, { FIRST_DEPLOY: '1', EXPECT_SUPPLY: '200000000000000000000000000' }));
-    says(r4, 'DOES NOT READ BACK AS EXPECTED',
+    says(r4, 'has no supply argument',
       'EXPECT_SUPPLY given in wei is caught rather than silently accepted');
   }
 
@@ -187,8 +231,12 @@ const env = (s, extra = {}) => ({
       deploymentTxs: { HCOWAnchor: '0xdead' },
       keepMe: 'a field no script knows about',
     });
-    const r = await run('deploy-token.cjs', env(s));
-    ok(r.status === 0, 'an existing record without HCOWToken needs no flag');
+    // 12차 감사 M-1: 이 단언은 "토큰 없는 레코드는 플래그가 필요 없다" 였다. 그것이
+    // 바로 레코드를 잃은 뒤 앵커만 적힌 새 파일로 두 번째 토큰을 발행하던 경로다.
+    // 이제 토큰을 부르지 않는 레코드는 FIRST_DEPLOY=1 을 요구하고, 여기서 보는 것은
+    // 그 플래그로 배포했을 때 레코드가 병합되는가다.
+    const r = await run('deploy-token.cjs', env(s, { FIRST_DEPLOY: '1' }));
+    ok(r.status === 0, 'an existing record without HCOWToken deploys with FIRST_DEPLOY=1 (12차)');
     const rec = readRec(56);
     ok(rec.addresses.HCOWAnchor === '0x2222222222222222222222222222222222222222',
       'HCOWAnchor survives the write');
@@ -257,6 +305,8 @@ const env = (s, extra = {}) => ({
     ok(s9.length === 3, 'three simultaneous faults produce three messages, not one');
   }
 
+  ok(snapshotDir(path.join(ROOT, 'deployments')) === REAL_DEPLOYMENTS_AT_START,
+    '이 스위트는 운영 레코드 디렉터리(deployments/)를 건드리지 않았다 (11차)');
   console.log(`\n${pass} passed, ${fail} failed\n`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

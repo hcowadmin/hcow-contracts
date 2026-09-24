@@ -5,7 +5,8 @@
 //   RPC_URL=... CHAIN_ID=97 TREASURY_KEY=0x... \
 //   node scripts/set-root.cjs --rounds build/merkle/rounds.json --round 0
 //
-//   PRINT_ONLY=yes ...   prints to / data for the treasury Safe instead of sending
+//   PRINT_ONLY=yes / DRY_RUN=yes ...   prints to / data for the treasury Safe instead
+//                                      of sending. TREASURY_KEY is not needed.
 //
 // WHY A SCRIPT AND NOT A HAND-TYPED CALL
 //
@@ -20,6 +21,7 @@
 const fs = require('fs');
 const path = require('path');
 const { connect, at, sendOrPrint, readRecord, ethers, dryFlag, suppressed } = require('./_connect.cjs');
+const { vestedAt } = require('./commitcheck.cjs');
 const { buildRound, verifyProof, leafB } = require('./merkle.cjs');
 
 const E = 10n ** 18n;
@@ -69,15 +71,42 @@ async function main() {
   console.log(`pays      ${hcow(total)} HCOW to ${Object.keys(tree.claims).length} addresses`);
 
   // ---- chain ------------------------------------------------------------
-  const { provider, signer, net, mainnet } = await connect({ keyVar: 'TREASURY_KEY' });
+  // 8차 감사 M-9. 이전 판은 needSigner 를 주지 않아 PRINT_ONLY 에서도
+  // TREASURY_KEY 를 요구했다. PRINT_ONLY 의 존재 이유가 "트레저리 개인키는
+  // 스크립트에 없고 있어서도 안 되므로 to/data 만 뽑아 Safe 에서 서명한다" 인데,
+  // 뽑으려면 개인키가 있어야 했다. load.cjs 는 처음부터 맞게 돼 있었다.
+  const noSend = suppressed();
+  const { provider, signer, net, mainnet } = await connect({ keyVar: 'TREASURY_KEY', needSigner: !noSend });
   const chainId = Number(net.chainId);
   const record = readRecord(chainId) || {};
   const claimAddr = o.claim || record.addresses?.HCOWClaim;
+  // 10차 감사. --claim 이 레코드의 HCOWClaim 과 다르면 이 스크립트는 고르지 않는다.
+  // 재현: 레코드가 가리키는 claim 과 다른 주소를 --claim 으로 주면 대조 없이
+  // exit 0 이었다. 둘 중 하나는 자금이 없는 claim 이고, 그 claim 에 등록된 루트는
+  // 아무에게도 지급하지 않는 채로 개시·동결된다.
+  const recordedClaim = record.addresses?.HCOWClaim;
+  if (o.claim && recordedClaim && o.claim.toLowerCase() !== recordedClaim.toLowerCase()) {
+    throw new Error(
+      `--claim ${o.claim} but deployments/${chainId}.json records HCOWClaim as ${recordedClaim}. One ` +
+      'of the two is wrong and this script will not pick. Vesting funds only the address it was ' +
+      'deployed with, so a root registered on the other one pays nobody.');
+  }
   if (!claimAddr) throw new Error('--claim <address> is required, or deployments/<chain>.json must name HCOWClaim');
 
+  // 9차 감사 B-F8. --claim 은 CLI 로 직접 받는, 이 저장소에서 오타 위험이 가장
+  // 큰 주소다. anchor.cjs 와 deploy-claim.cjs 는 코드 존재를 먼저 보는데 여기만
+  // 없어서, 오타를 내면 ethers 내부 오류(BAD_DATA)로 끝났다.
+  if (!ethers.isAddress(claimAddr)) throw new Error(`--claim ${claimAddr} is not an address`);
+  if (await provider.getCode(claimAddr) === '0x') {
+    throw new Error(
+      `there is no contract at ${claimAddr} on chain ${chainId}. That address came from ` +
+      `${o.claim ? '--claim' : `deployments/${chainId}.json`}. Check it before anything is signed.`);
+  }
   const claim = at('HCOWClaim', claimAddr, provider);
-  const me = await signer.getAddress();
   const [owner, onchain, tokenAddr] = await Promise.all([claim.owner(), claim.rounds(roundId), claim.token()]);
+  // 키가 없을 때 찍을 `from` 은 체인에서 읽은 owner 다. 이 호출을 실제로 보낼 수
+  // 있는 주소가 그것 하나이고, 레코드의 treasury 가 아니라 체인이 근거여야 한다.
+  const me = noSend ? owner : await signer.getAddress();
   const held = await at('HCOWToken', tokenAddr, provider).balanceOf(claimAddr);
   const nowTs = (await provider.getBlock('latest')).timestamp;
 
@@ -147,21 +176,222 @@ async function main() {
   // the round. It said that while this was a console.log. (Audit 4, H-9.)
   // Claims revert safely when underfunded, so this is a stop and not a
   // disaster, but the document has to be true.
-  if (held < total) {
+  // 11차 감사. 이 검사는 "지금 claim 이 들고 있는 잔고" 만 봤다. 그런데 0번
+  // 라운드(TGE 지급, 공개 약속 "시즌 1 상금 HCOW 는 TGE 시점 지급")는 구조상
+  // TGE 전에 등록해야 하고(minRoundNotice), 그 시점에 claim 잔고는 언제나 0 이다 —
+  // 베스팅은 TGE 에야 풀린다. 재현: 정해진 순서대로 가면 0번 라운드는
+  // ALLOW_UNDERFUNDED=yes 없이는 등록되지 않았다. 즉 이 가드는 가장 중요한
+  // 라운드에서 한 번도 작동하지 않고 매번 꺼지고 있었다.
+  //
+  // 맞는 질문은 "startTime 에 이 라운드를 낼 수 있는가" 다. 봉인된 베스팅이
+  // 이 claim 에 줄 몫 중 startTime 까지 풀릴 양(누가 그 시점에 release 를
+  // 부르면 들어올 양)을 더한다. 베스팅이 봉인되지 않았으면 release() 가
+  // 되돌려지므로 0 으로 센다.
+  let pending = 0n;
+  let pendingNote = '';
+  let willBeVested = null;   // 봉인된 베스팅이 startTime 까지 이 claim 에 풀어줄 누계. 없으면 null
+  let directFloor = 0n;
+  const vestingAddr = record.addresses?.HCOWVesting;
+  // 12차 감사 M-B 때문에 held 가 충분해도 베스팅을 읽는다: 아래 누계 검사에 필요하다.
+  if (vestingAddr) {
+    const v = at('HCOWVesting', vestingAddr, provider);
+    const [vSealed, vTge, sched] = await Promise.all([
+      v.sealed_().catch(() => false), v.tgeTime().catch(() => 0n), v.schedules(claimAddr).catch(() => null),
+    ]);
+    if (vSealed && sched && sched.exists) {
+      willBeVested = vestedAt(
+        { total: sched.total, tgeBps: sched.tgeBps, cliffMonths: sched.cliffMonths, linearMonths: sched.linearMonths },
+        vTge, tree.startTime);
+      pending = willBeVested > sched.released ? willBeVested - sched.released : 0n;
+      // 누계 검사에 쓸, 베스팅 밖에서 들어온 양의 하한. held = released + 직접송금 − 청구분
+      // 이고 청구분 >= 0 이므로 직접송금 >= held − released, 그리고 >= 0.
+      directFloor = held > sched.released ? held - sched.released : 0n;
+      pendingNote = `vesting ${vestingAddr} will have released ${hcow(pending)} more HCOW to it by the round's start`;
+    } else if (!vSealed) {
+      pendingNote = `vesting ${vestingAddr} is not sealed, so nothing it holds counts yet`;
+    } else {
+      pendingNote = `vesting ${vestingAddr} has no schedule for this claim contract`;
+    }
+    if (held < total) console.log(`          ${pendingNote}`);
+  }
+  if (held + pending < total) {
     if (!dryFlag('ALLOW_UNDERFUNDED')) {
       throw new Error(
-        `the round pays ${hcow(total)} HCOW and the contract holds ${hcow(held)}. Every claim past the ` +
+        `the round pays ${hcow(total)} HCOW and the contract holds ${hcow(held)}${pending ? ` plus ${hcow(pending)} the vesting will release by then` : ''}. Every claim past the ` +
         'balance reverts with InsufficientBalance until the vesting release lands, and the root is frozen ' +
         'the moment the round opens. Release the bucket first, or set ALLOW_UNDERFUNDED=yes if opening ' +
         'ahead of funding is deliberate.');
     }
     console.log(`          WARNING: the round pays ${hcow(total)} HCOW and only ${hcow(held)} is here. ` +
                 'ALLOW_UNDERFUNDED is set, so this is going ahead.');
+  } else if (held < total) {
+    console.log(`          funded at start: ${hcow(held)} held now plus what vesting releases by then. Someone must call`);
+    console.log(`          release(${claimAddr}) on the vesting contract at or after the round opens;`);
+    console.log('          until then claims revert whole with InsufficientBalance and nothing is lost.');
+  }
+  // 12차 감사 M-B. 바로 위 검사는 이 라운드 하나만 본다. 그런데 HCOWClaim 은 모든
+  // 라운드가 잔고 하나를 나눠 쓴다 (_claim 은 balanceOf(this) >= amount 만 본다).
+  // held 에는 앞 라운드가 아직 받아가지 않은 몫이 들어 있다. 재현: 0번 라운드를
+  // TGE 언락 전액으로 등록한 뒤, 단독으로는 맞지만 누계로는 1,000 HCOW 넘치는
+  // 1번 라운드가 exit 0 으로 등록됐다. 1번 청구자는 받았고 0번(TGE 상금 포함)
+  // 청구는 InsufficientBalance 로 막혔다. 잃은 것은 없지만(청구가 통째로 되돌려진다)
+  // 앞 라운드가 뒤 라운드에 밀리는 선착순이 된다.
+  //
+  // 맞는 질문: 이 라운드가 열릴 때까지 베스팅이 이 claim 에 푼 누계가, 그때까지
+  // 열리는 모든 라운드 합계 이상인가. 청구된 양과 무관한 부등식이다 (둘 다에서
+  // 같이 빠진다). 직접 송금은 하한(held − released, 0 이상)만 세므로 안전한 쪽으로
+  // 틀린다. 합계는 이 라운드 파일들에서 다시 계산하고, 이미 등록된 라운드는 체인의
+  // 루트와 대조한다.
+  // 이 스크립트가 알 수 없는 것: 이 빌드에 없는 roundId 로 체인에 등록된 루트.
+  // 매핑은 열거할 수 없다.
+  //
+  // 13차 감사로 세 가지를 더 닫았다.
+  //  (a) 이 라운드보다 **뒤에** 열리도록 이미 등록된 라운드도 본다. 앞선 날짜의
+  //      라운드를 나중에 끼워 넣으면, 그 뒤에 이미 등록된 라운드가 넘치게 된다.
+  //      재현: 0~4번 등록 뒤 7번(+45일)을 끼우니 exit 0, 2번 청구 3건 실패. 이제
+  //      이 라운드의 시작과, 그 뒤에 등록된 각 라운드의 시작마다 누계를 잰다.
+  //  (b) 등록된 라운드의 시작 시각은 파일이 아니라 체인에서 읽는다. 루트는 시작
+  //      시각을 담지 않으므로, 파일과 다른 시각으로 등록된 라운드를 파일 시각으로
+  //      걸러 빠뜨렸다 (재현함).
+  //  (c) 베스팅 수치가 없으면(베스팅 미기록 · 미봉인 · 이 claim 의 행 없음) 누계를
+  //      계산만 하고 무시했다. 그때는 지금 잔고가 아직 열리지 않은 라운드 합계를
+  //      덮는지 본다. 이미 열린 라운드의 남은 몫은 청구량을 모르므로 세지 못한다.
+  const included = [{ roundId, start: tree.startTime, total, registered: false, self: true }];
+  const staleRounds = [];
+  for (const r of summary.rounds) {
+    if (r.roundId === roundId) continue;
+    const oc = await claim.rounds(r.roundId);
+    const onRoot = String(oc.merkleRoot).toLowerCase();
+    const fileRoot = String(r.merkleRoot).toLowerCase();
+    const registered = onRoot !== ethers.ZeroHash;
+    // 14차 감사 M-1. 13차 판은 등록된 루트가 파일과 다르면 무조건 멈췄다. 그런데
+    // TGE 전 정정(수령자 추가 → build-merkle 재실행)은 모든 라운드의 루트를 바꾸고,
+    // 아직 열리지 않은 라운드는 교체가 정당한 유일한 정정 경로다. 재현: 0~4번을
+    // 미리 등록한 뒤 재빌드하니 어떤 순서로도 모든 라운드가 거부됐고 우회 플래그도
+    // 없었다. 이제 **이미 열린** 라운드만 멈춘다(그 루트는 영원히 고정이고 이 빌드는
+    // 그 빚을 모른다). 아직 열리지 않은 라운드는 파일의 판으로 세고, 더 이른 시각으로
+    // 세며(체인과 파일 중), 열리기 전에 교체하라고 크게 경고한다. 옛 루트의 합계는
+    // 이 스크립트가 읽을 수 없다.
+    let stale = false;
+    if (registered && onRoot !== fileRoot) {
+      if (Number(oc.startTime) <= nowTs) {
+        throw new Error(
+          `round ${r.roundId} is registered on chain with root ${oc.merkleRoot} and has already opened, but ` +
+          `${roundsFile} names ${r.merkleRoot}. That root is frozen and this build does not describe what it ` +
+          'owes, so this script cannot tell whether the balance covers round ' + roundId + ' as well. ' +
+          'Nothing has been sent.');
+      }
+      // 15차 감사 F1. 열리지 않았어도 이제 교체할 수 없는 라운드가 있다: 파일의 시작이
+      // LEAD(>= notice) 안이면 setRoot 가 되돌려지고 이 스크립트도 거부하며, 체인의
+      // 시작이 LEAD 안이면 대기 중인 Safe 트랜잭션보다 옛 루트가 먼저 열린다. 그때
+      // 실제로 지급하는 것은 옛 루트이므로 파일의 판으로 셀 수 없다. 열린 것과 같이 멈춘다.
+      // 재현: 옛 루트가 2일 뒤 열리고 LEAD 3일일 때 exit 0, 이후 0번 청구가 실패했다.
+      if (Number(oc.startTime) - nowTs < LEAD || Number(r.startTime) - nowTs < LEAD) {
+        throw new Error(
+          `round ${r.roundId} is registered on chain with root ${oc.merkleRoot}, opening ` +
+          `${new Date(Number(oc.startTime) * 1000).toISOString()}, but ${roundsFile} names ${r.merkleRoot}` +
+          ` opening ${new Date(Number(r.startTime) * 1000).toISOString()}. It can no longer be replaced in ` +
+          `time (a ${(LEAD / 3600).toFixed(1)} hour margin is needed on both), so the old root is what it ` +
+          'will pay and this build does not describe it. Nothing has been sent. (16차: to register other ' +
+          `rounds from this build, put back round ${r.roundId}'s entry in rounds.json and its round file ` +
+          'from the build that produced the on-chain root, so the two agree.)');
+      }
+      stale = true;
+      staleRounds.push(r.roundId);
+    }
+    let start;
+    if (stale) {
+      start = Math.min(Number(oc.startTime), Number(r.startTime));
+    } else if (registered) {
+      start = Number(oc.startTime);
+      if (start !== Number(r.startTime)) {
+        console.log(`          round ${r.roundId} is registered on chain to open ${new Date(start * 1000).toISOString()}, ` +
+                    `not at the file's ${new Date(Number(r.startTime) * 1000).toISOString()}; using the chain`);
+      }
+    } else {
+      start = Number(r.startTime);
+      if (start <= nowTs + notice) {
+        // 등록되지 않았고, 이제는 그 startTime 으로 등록할 수도 없다 (notice). 빚이 아니다.
+        console.log(`          round ${r.roundId} is not registered and can no longer open at its start; not counted`);
+        continue;
+      }
+      // 이 라운드보다 뒤에 열릴 미등록 라운드는 그것을 등록할 때 이 검사를 받는다.
+      if (start > tree.startTime) continue;
+    }
+    const f = path.join(path.dirname(path.resolve(roundsFile)), `round-${r.roundId}.json`);
+    if (!fs.existsSync(f)) {
+      throw new Error(`${roundsFile} lists round ${r.roundId}, which this check has to count, but ${f} is missing. ` +
+                      'Its total cannot be checked, so the balance cannot be checked. Nothing has been sent.');
+    }
+    const t = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (String(t.merkleRoot).toLowerCase() !== fileRoot) {
+      throw new Error(`${f} and ${roundsFile} name different roots for round ${r.roundId}. Nothing has been sent.`);
+    }
+    // 14차 감사(기존 결함). 다른 라운드의 합계는 claims 목록에서 더하는데, 그 목록이
+    // 루트 필드와 맞는지는 보지 않았다. 이 라운드처럼 다시 빌드해 대조한다.
+    const rb = buildRound(r.roundId, Object.entries(t.claims).map(([account, c]) => ({ account, amount: c.amount })));
+    if (rb.root.toLowerCase() !== fileRoot) {
+      throw new Error(`${f}'s claims rebuild to ${rb.root}, not the root ${r.merkleRoot} it names. Its total cannot ` +
+                      'be trusted, so the balance cannot be checked. Nothing has been sent.');
+    }
+    const rTotal = Object.values(t.claims).reduce((a, c) => a + BigInt(c.amount), 0n);
+    included.push({ roundId: r.roundId, start, total: rTotal, registered });
+  }
+  included.sort((a, b) => a.start - b.start);
+  if (staleRounds.length) {
+    console.log(`          WARNING: round${staleRounds.length > 1 ? 's' : ''} ${staleRounds.join(', ')} ` +
+                `${staleRounds.length > 1 ? 'are' : 'is'} registered with a different root than this build and ` +
+                'not yet open. This check counts the build\'s version. Replace each with set-root before it ' +
+                'opens: until then the old root is what it pays, and its total is not known here.');
+  }
+  const others = included.filter((x) => !x.self);
+  if (others.length) {
+    console.log(`          rounds counted with this one: ` + others.map((x) =>
+      `round ${x.roundId} ${hcow(x.total)}${x.registered ? '' : ' (not registered yet)'}` +
+      `${x.start > tree.startTime ? ' (opens later)' : ''}`).join(', '));
+  }
+  // 이 라운드의 시작, 그리고 그 뒤에 등록된 각 라운드의 시작이 검사 시점이다.
+  const checkpoints = included.filter((x) => x.start >= tree.startTime && (x.self || x.registered));
+  for (const cp of checkpoints) {
+    const upTo = included.filter((x) => x.start <= cp.start);
+    let need, have, what;
+    if (willBeVested !== null) {
+      need = upTo.reduce((a, x) => a + x.total, 0n);
+      const v = at('HCOWVesting', vestingAddr, provider);
+      const sched = await v.schedules(claimAddr);
+      const vTge = await v.tgeTime();
+      const vested = vestedAt(
+        { total: sched.total, tgeBps: sched.tgeBps, cliffMonths: sched.cliffMonths, linearMonths: sched.linearMonths },
+        vTge, cp.start);
+      have = vested + directFloor;
+      what = `the vesting will have released ${hcow(vested)} HCOW to this claim contract in total` +
+             `${directFloor ? ` (plus at least ${hcow(directFloor)} sent to it directly)` : ''}`;
+    } else {
+      need = upTo.filter((x) => x.start > nowTs).reduce((a, x) => a + x.total, 0n);
+      have = held;
+      what = `there is no sealed vesting figure for this claim contract, and it holds ${hcow(held)} HCOW`;
+    }
+    if (have < need) {
+      const at_ = cp.self ? `round ${roundId} opens` : `round ${cp.roundId} (already registered) opens`;
+      if (!dryFlag('ALLOW_UNDERFUNDED')) {
+        throw new Error(
+          `by the time ${at_}, ${what}, but the rounds open by then pay ${hcow(need)} HCOW in total ` +
+          `(${upTo.map((x) => `round ${x.roundId} ${hcow(x.total)}`).join(', ')}). The contract has one balance ` +
+          'for all rounds, so whoever claims first is paid and an earlier round\'s claimants can be the ones ' +
+          'left waiting. Move this round later, or set ALLOW_UNDERFUNDED=yes if that is deliberate.');
+      }
+      console.log(`          WARNING: by the time ${at_} the rounds open by then pay ${hcow(need)} HCOW and ` +
+                  `only ${hcow(have)} is accounted for. ALLOW_UNDERFUNDED is set, so this is going ahead.`);
+    }
   }
   // 7차 감사 H-3. 이 스크립트는 PRINT_ONLY 만 알고 DRY_RUN 을 몰랐다.
   // DRY_RUN=yes 는 정의되지 않은 환경변수로 무시되고 setRoot 가 실제로 나갔다.
-  if (!suppressed() && owner.toLowerCase() !== me.toLowerCase()) {
-    throw new Error(`TREASURY_KEY is ${me} but the owner is ${owner}. Use PRINT_ONLY=yes and sign from the Safe.`);
+  if (!noSend && owner.toLowerCase() !== me.toLowerCase()) {
+    // 8차 감사 L-4. 문구가 PRINT_ONLY 만 안내했다. 7차 조치로 두 이름은 같은 뜻이다.
+    throw new Error(
+      `TREASURY_KEY is ${me} but the owner is ${owner}. Re-run with PRINT_ONLY=yes (or DRY_RUN=yes, ` +
+      'the same thing) to print `to` and `data`, and sign it from the Safe. Neither name needs ' +
+      'TREASURY_KEY to be set at all.');
   }
 
   await sendOrPrint(

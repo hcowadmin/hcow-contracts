@@ -17,7 +17,19 @@ const { Address, hexToBytes, bytesToHex, privateToAddress } = require('@ethereum
 const ROOT = path.join(__dirname, '..', '..');
 const art = (n) => JSON.parse(fs.readFileSync(path.join(ROOT, 'artifacts', `${n}.json`), 'utf8'));
 
-async function makeNode({ chainId, now }) {
+// 9차 감사. balances: 주소(소문자) -> wei 문자열/BigInt 로 잔액을 덮어쓴다.
+// 이 노드는 모든 주소에 1 BNB 를 리턴했고, 그래서 저장소 네 곳의
+// `bal === 0n && !dryRun` 가드는 테스트로 닿을 수 없었다 (그 중 하나는 실제로
+// 빠져 있었고 아무도 몰랐다 — 9차 B-F1).
+// 12차 감사 L-1. harnessMarker: 이 노드가 테스트 하네스임을 스스로 밝힌다
+// (hcow_isTestHarness → true). _connect.cjs 는 HCOW_RECORD_DIR 가 설정돼 있으면
+// 이 대답을 요구한다. 루프백 주소만으로는 로컬 BSC 노드나 SSH 터널과 구분되지
+// 않았다. false 로 끄면 "루프백이지만 하네스가 아닌 노드" 를 흉내낸다.
+async function makeNode({ chainId, now, balances: balancesIn = {}, harnessMarker = true }) {
+  // 10차 감사: 키를 대소문자 그대로 조회해서, 체크섬 표기로 넣은 0 이 조용히
+  // 1 BNB 로 떨어졌다. 소문자로 정규화한다.
+  const balances = Object.fromEntries(
+    Object.entries(balancesIn).map(([k, v]) => [String(k).toLowerCase(), v]));
   const common = Common.custom({ chainId, networkId: chainId }, { hardfork: Hardfork.Paris, baseChain: Chain.Mainnet });
   const vm = await VM.create({ common, setHardfork: false });
   let ts = BigInt(now);
@@ -66,9 +78,14 @@ async function makeNode({ chainId, now }) {
       switch (m) {
         case 'eth_chainId': return ok('0x' + chainId.toString(16));
         case 'net_version': return ok(String(chainId));
+        case 'hcow_isTestHarness': return harnessMarker ? ok(true) : err('unsupported method ' + m);
         case 'eth_blockNumber': return ok('0x' + blockNumber.toString(16));
         case 'eth_gasPrice': return ok('0x1');
-        case 'eth_getBalance': return ok('0x' + (10n ** 18n).toString(16));
+        case 'eth_getBalance': {
+          const key = String(p[0]).toLowerCase();
+          const v = Object.prototype.hasOwnProperty.call(balances, key) ? BigInt(balances[key]) : 10n ** 18n;
+          return ok('0x' + v.toString(16));
+        }
         case 'eth_getCode': {
           const a = new Address(hexToBytes(p[0]));
           const c = await vm.stateManager.getContractCode(a);

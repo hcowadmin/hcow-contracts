@@ -5,7 +5,8 @@
  *
  *   node scripts/build-merkle.cjs <recipients.csv|.json> \
  *        --policy schedule/airdrop-policy.json \
- *        --expect-total <wei> [--tge <unix seconds>] [--out build/merkle]
+ *        --expect-total <announced total, in wei or decimal HCOW>
+ *        [--tge <unix seconds>] [--out build/merkle]
  *
  * WHY THIS FILE IS LONGER THAN THE CONTRACT
  *
@@ -88,8 +89,25 @@ function loadRecipients(file) {
 // 직접 호출하는 진입점이고, 파일을 거치지 않는다.
 // 7차 감사 M-1. 빌더도 set-root 도 minClaimAmount 라는 단어를 몰랐다(양쪽 grep 0건).
 // 컨트랙트의 바닥값이 어떤 리프보다 높으면 그 리프는 루트가 동결되는 순간
-// 영구 청구 불가다. 실측: 실입력 1,205명 빌드의 round 0 에 1 HCOW 미만 리프가
-// 229개, 합 192.19 HCOW. 대표 결정으로 빌더가 대조하고 중단한다.
+// 영구 청구 불가다. 대표 결정으로 빌더가 대조하고 중단한다.
+//
+// 8차 감사 M-3 정정. 7차에 여기 적었던 "round 0 에 1 HCOW 미만 229개, 합 192.19"
+// 는 틀린 숫자였다. 아무도 재현하지 않았고, 재현하니 세 번 재서 세 번 달랐다.
+// 아래가 실제 빌더를 실입력으로 돌려 나온 값이고, 재현 절차를 같이 적는다.
+//
+//   입력   TaskOn 리더보드 원본, 포인트 보유 1,291명 / 235,410점
+//          그중 Primary EVM 주소 보유 1,205명 / 224,435점 (중복 주소 0건)
+//   배분   100,000 HCOW 풀 비례, 계정별 floor
+//   정책   schedule/airdrop-policy.example.json 의 taskon (tgeBps 2000, tailRounds 4)
+//
+//   round 0      1 HCOW 미만 520개, 합 234.909307166220635891 HCOW
+//   round 1~4    각 520개, 각 약 234.9093 HCOW
+//   전체 5라운드 2,600개, 합 1,174.546535831103181502 HCOW
+//   최소 리프    0.424790790535661186 HCOW  (5점 보유자)
+//
+// 최소 리프가 0.42 HCOW 인 이유는 리더보드 최저 점수가 5점이고 라운드가 다섯이라
+// 한 라운드당 1점 몫이 돌아가기 때문이다. 바닥값을 1 HCOW 로 잡으면 2,600개
+// 리프가 영구 청구 불가가 된다.
 function assertFloor(v) {
   if (v === undefined || v === null) return 0n;
   const raw = String(v).trim();
@@ -119,6 +137,20 @@ function assertBucket(b) {
     if (!Number.isInteger(v) || v < 0) {
       throw new Error(`policy.bucket.${k} must be a non-negative integer, got ${b[k]}`);
     }
+  }
+  // 8차 감사 H-4. 이 함수가 linearMonths 를 "비음수 정수" 로만 봤다. 0 이 통과하면
+  // vestedAt 의 `if (duration === 0n) return total;` 때문에 TGE 시점에 버킷 전액이
+  // 풀린 것으로 계산되고, check 6("베스팅이 풀기 전에 배포하지 않는다")이 통째로
+  // 무력화된다. 이 가드가 이름을 대놓고 검사하는 필드로 그 검사를 끌 수 있었다.
+  //
+  // tgeBps 가 10000 이면 TGE 에 전액 언락이 맞고 그때는 linearMonths 가 의미를
+  // 갖지 않는다. 그 하나만 예외다.
+  if (bps < 10000 && Number(b.linearMonths) === 0) {
+    throw new Error(
+      `policy.bucket.linearMonths is 0 while tgeBps is ${bps}, which is a contradiction: the bucket ` +
+      'says only part of it unlocks at TGE and then says the rest takes no time. vestedAt returns the ' +
+      'whole bucket at TGE for a zero duration, so check 6 would pass on any tree at all. ' +
+      'Use linearMonths >= 1, or tgeBps 10000 if the bucket really is fully unlocked at TGE.');
   }
 }
 
@@ -460,26 +492,67 @@ function buildDistribution(rawRows, policy, { tgeTime, expectTotal } = {}) {
     }
   }
 
-  // ---- check 9. 공표 총액 (7차 M-2) --------------------------------------
+  // ---- check 9. 공표 총액 (7차 M-2 · 8차 M-2) ----------------------------
   //
   // check 5 는 같은 rows 에서 나온 두 합을 비교하므로 상류의 반올림 방향을
   // 볼 수 없다. 실측: floor / round-half / ceil 세 입력이 전부 "grand total
   // exact" 를 출력했다. 유일한 상한이던 policy.bucket.total 은 실제 배포의
   // 85배였다. 공표한 숫자를 밖에서 넣어야 이 구멍이 닫힌다.
+  //
+  // 8차 감사 M-2. 7차 판은 wei 정수만 받았고, 그래서 **실제 1차 트랜치로는 절대
+  // 만족시킬 수 없었다.** 재현: 주소 보유 1,205명 비례 floor 배분의 합은
+  // 95337921073871118473546 wei 이고 공표 숫자 95,337.92 HCOW 는
+  // 95337920000000000000000 wei 다. 차이 약 0.00107 HCOW. 공표 숫자를 넣으면 항상
+  // 실패하고, 빌더가 출력한 숫자를 되넣으면 검사가 자기참조가 되어 존재 이유를
+  // 잃는다. 실제로 두 번 재서 86 wei 차이가 났다 — 사람이 독립적으로 재현할 수
+  // 있는 숫자가 아니다.
+  //
+  // 그래서 공표한 **단위와 자리수 그대로** 받는다.
+  //
+  //   --expect-total 95337921073871118473546   wei 정확일치 (빌드 후 트리 옆에 기록할 값)
+  //   --expect-total 95337.92                  HCOW, 소수 2자리까지 일치
+  //
+  // 소수 형태는 "totalIn 을 그 자리수에서 절단한 값이 공표 숫자와 정확히 같다" 로
+  // 해석한다. 절단이므로 totalIn 은 [공표값, 공표값 + 1단위) 안에 있어야 하고,
+  // 공표값보다 작으면 실패한다.
+  //
+  // 이 검사가 무엇을 잡고 무엇을 못 잡는지 정직하게: 공표 자리수보다 **굵은**
+  // 오차는 전부 잡는다 (자리수 밀림, 사람 단위로 반올림한 상류, 명단 누락·중복).
+  // 리프당 1 wei 짜리 floor/ceil 차이는 못 잡는다 — 1,205개 리프 전체로도 1,205
+  // wei, 즉 1.2e-15 HCOW 이고, 소수 2자리 공표로는 원리적으로 구분되지 않는다.
+  // 그것까지 묶으려면 wei 정확일치 형태를 쓰는 수밖에 없다.
   if (expectTotal !== undefined && expectTotal !== null) {
     const raw = String(expectTotal).trim();
-    if (!/^\d+$/.test(raw)) {
+    const asWei = /^\d+$/.test(raw);
+    const m = /^(\d+)\.(\d{1,18})$/.exec(raw);
+    if (!asWei && !m) {
       throw new Error(
-        `expectTotal "${expectTotal}" must be an integer number of wei, written as a string. ` +
-        'A figure like 95337.92 is HCOW, not wei; multiply it out before passing it.');
+        `expectTotal "${expectTotal}" is neither an integer number of wei nor a decimal HCOW figure ` +
+        'with 1 to 18 decimal places. Pass the announced figure exactly as it was announced ' +
+        '(for example 95337.92), or the exact wei total. No thousands separators, no units, no sign.');
     }
-    const want = BigInt(raw);
-    if (totalIn !== want) {
-      const diff = totalIn > want ? totalIn - want : want - totalIn;
-      throw new Error(
-        `the input distributes ${totalIn} wei but the announced total is ${want} wei, a difference ` +
-        `of ${diff} wei. This is the only check that can see a rounding direction chosen upstream, ` +
-        'and it is what the announcement committed to. Nothing has been written.');
+    if (asWei) {
+      const want = BigInt(raw);
+      if (totalIn !== want) {
+        const diff = totalIn > want ? totalIn - want : want - totalIn;
+        throw new Error(
+          `the input distributes ${totalIn} wei but --expect-total says ${want} wei, a difference of ` +
+          `${diff} wei. Passed as an integer this is an exact-wei comparison. If you meant the ` +
+          'announced HCOW figure, pass it with its decimal point instead. Nothing has been written.');
+      }
+    } else {
+      const places = m[2].length;
+      const unit = 10n ** BigInt(18 - places);
+      const want = BigInt(m[1]) * 10n ** 18n + BigInt(m[2].padEnd(18, '0'));
+      const truncated = (totalIn / unit) * unit;
+      if (truncated !== want) {
+        const sign = totalIn < want ? 'less' : 'more';
+        throw new Error(
+          `the input distributes ${totalIn} wei. Truncated to ${places} decimal places that is ` +
+          `${truncated} wei, and the announced figure ${raw} is ${want} wei. The distribution is ` +
+          `${sign} than announced by at least one unit in the last announced decimal place. ` +
+          'Nothing has been written.');
+      }
     }
   }
 
@@ -502,7 +575,7 @@ function main(argv) {
   const flag = (name, dflt) => (opts[name] === undefined ? dflt : opts[name]);
   const input = positional[0];
   if (!input) {
-    console.error('usage: node scripts/build-merkle.cjs <recipients.csv|.json> --policy <policy.json> --expect-total <wei> [--tge <unix>] [--out build/merkle]');
+    console.error('usage: node scripts/build-merkle.cjs <recipients.csv|.json> --policy <policy.json> --expect-total <wei|HCOW.dd> [--tge <unix>] [--out build/merkle]');
     process.exitCode = 1;
     return;
   }
@@ -514,9 +587,11 @@ function main(argv) {
   const expectTotal = flag('expect-total', undefined);
   if (expectTotal === undefined) {
     console.error(
-      'missing --expect-total <wei>. It is the figure the distribution was announced with, in wei, ' +
-      'and the build refuses to run without it. Every other total check here compares the input with ' +
-      'itself; this is the only one that can catch a rounding direction chosen before this script ran.');
+      'missing --expect-total. It is the figure the distribution was announced with, and the build ' +
+      'refuses to run without it. Pass it exactly as announced: a decimal HCOW figure such as ' +
+      '95337.92 is compared at that many decimal places, an integer is compared as an exact wei ' +
+      'total. Every other total check here compares the input with itself; this is the only one that ' +
+      'reaches outside the input at all.');
     process.exitCode = 1;
     return;
   }
