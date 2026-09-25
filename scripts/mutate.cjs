@@ -1468,6 +1468,55 @@ const MUTATIONS = [
     run: JS(OG),
     expect: "deploy-claim 은 claim 이 배포된 블록 번호를 레코드에 남긴다 (RoundSet 조회 재검 F4)",
   },
+  // A-6 (13차 L5): 행 단위 공표 수치
+  {
+    name: "A-6: deploy.cjs 가 행 단위 공표 수치를 보지 않는다",
+    file: DEP,
+    from: "  if (mainnet) {\n    const pub = meta.rowsMustEqual;",
+    to:   "  if (false) {\n    const pub = meta.rowsMustEqual;",
+    run: JS(OG),
+    expect: "두 행을 상쇄되게 바꾸면 메인넷 배포가 거부된다 (A-6)",
+  },
+  {
+    name: "A-6: 행 단위 대조가 TGE 언락을 빠뜨린다",
+    file: DEP,
+    from: "          ['tgeUnlock', tgeUnlockOf(total, r.tgeBps, r.cliffMonths, r.linearMonths)],\n",
+    to:   "",
+    run: JS(OG),
+    expect: "두 행을 상쇄되게 바꾸면 메인넷 배포가 거부된다 (A-6)",
+  },
+  {
+    name: "A-6: 행 단위 대조가 클리프를 빠뜨린다",
+    file: DEP,
+    from: "          ['cliffMonths', BigInt(r.cliffMonths)],\n",
+    to:   "",
+    run: JS(OG),
+    expect: "클리프만 바뀌어도 거부된다 (A-6)",
+  },
+  {
+    name: "A-6: 공표 행의 이름(순서)을 보지 않는다",
+    file: DEP,
+    from: "        if (String(p.label ?? '') !== String(r.label ?? '')) {",
+    to:   "        if (false) {",
+    run: JS(OG),
+    expect: "공표 행 순서가 다르면 거부된다 (A-6)",
+  },
+  {
+    name: "A-6: 공표 행 개수를 보지 않는다",
+    file: DEP,
+    from: "    if (!Array.isArray(pub) || pub.length !== rows.length) {",
+    to:   "    if (!Array.isArray(pub)) {",
+    run: JS(OG),
+    expect: "공표 행이 8개면 거부된다 (A-6)",
+  },
+  {
+    name: "A-6: 행 단위 검사가 테스트넷에도 걸린다",
+    file: DEP,
+    from: "  if (mainnet) {\n    const pub = meta.rowsMustEqual;",
+    to:   "  if (true) {\n    const pub = meta.rowsMustEqual;",
+    run: JS(OG),
+    expect: "대조군: 테스트넷은 공표 행 없이도 배포된다 (A-6)",
+  },
 ];
 function run(m) {
   const p = path.join(ROOT, m.file);

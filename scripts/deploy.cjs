@@ -31,7 +31,7 @@
 const path = require('path');
 const { connect, deploy, at, writeRecord, readRecord, suppressed, ethers } = require('./_connect.cjs');
 const { commitments } = require('../vestcommit.cjs');
-const { loadSchedule } = require('./commitcheck.cjs');
+const { loadSchedule, tgeUnlockOf } = require('./commitcheck.cjs');
 
 const DAY = 24 * 60 * 60;
 
@@ -289,6 +289,52 @@ async function main() {
         `${file} does not match its own published figures:\n  ${off.join('\n  ')}\n\nA row's terms ` +
         'changed while its figures did not. The Airdrop row decides what the claim contract has at TGE, ' +
         'which is what round 0 pays. Nothing has been deployed.');
+    }
+  }
+
+  // A-6 (13차 L5). 위 검사는 표 전체의 합계 두 개만 본다. 두 행을 서로 상쇄되게
+  // 고치면 통과한다. 재현: Airdrop TGE 3750→0 과 Public TGE 1500→2000 을 같이 바꾸면
+  // 합계 200,000,000 · TGE 언락 27,000,000 이 그대로라 exit 0 이었다. 그러면 claim 은
+  // TGE 에 아무것도 받지 못하고 시즌 1 "TGE 시점 지급" 약속의 재원이 사라진다.
+  // 그래서 공표된 배정표의 행마다 수량 · TGE 언락 · 클리프 · 선형 개월을 파일의 데이터로
+  // 적어 두고(meta.rowsMustEqual, 표 순서대로) 행 단위로 대조한다. 값은 하드코딩이 아니라
+  // 파일의 데이터다. 메인넷에서는 반드시 있어야 한다.
+  if (mainnet) {
+    const pub = meta.rowsMustEqual;
+    const off = [];
+    if (!Array.isArray(pub) || pub.length !== rows.length) {
+      off.push(`meta.rowsMustEqual has ${Array.isArray(pub) ? `${pub.length} entries` : JSON.stringify(pub)}; ` +
+               `on mainnet it must list the ${rows.length} published rows in table order`);
+    } else {
+      for (const [i, r] of rows.entries()) {
+        const p = pub[i] || {};
+        const where = `row ${i} (${r.label ?? 'no label'})`;
+        if (String(p.label ?? '') !== String(r.label ?? '')) {
+          off.push(`${where}: the published row ${i} is ${JSON.stringify(p.label)}`);
+          continue;
+        }
+        const total = BigInt(r.total);
+        const want = [
+          ['total', total],
+          ['tgeUnlock', tgeUnlockOf(total, r.tgeBps, r.cliffMonths, r.linearMonths)],
+          ['cliffMonths', BigInt(r.cliffMonths)],
+          ['linearMonths', BigInt(r.linearMonths)],
+        ];
+        for (const [k, got] of want) {
+          const v = p[k];
+          if (v === undefined || v === null || !/^\d+$/.test(String(v).trim())) {
+            off.push(`${where}: meta.rowsMustEqual[${i}].${k} is ${JSON.stringify(v)}; it must be the published figure`);
+          } else if (BigInt(String(v).trim()) !== got) {
+            off.push(`${where}: ${k} is ${got} but the published figure is ${String(v).trim()}`);
+          }
+        }
+      }
+    }
+    if (off.length) {
+      throw new Error(
+        `${file} does not match its own published rows:\n  ${off.join('\n  ')}\n\nThe table's totals can ` +
+        'still add up when two rows are changed against each other, so each row is checked on its own. ' +
+        'Nothing has been deployed.');
     }
   }
 

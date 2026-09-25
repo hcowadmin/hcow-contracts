@@ -427,8 +427,13 @@ const env = (s) => ({
     }));
     let meta = {};
     try {
-      const cm = require('../scripts/commitcheck.cjs').commitments(rows.map((r) => ({ ...r, total: BigInt(r.total) })));
-      meta = { totalsMustEqual: cm.total.toString(), tgeUnlockMustEqual: cm.unlock.toString() };
+      const cc = require('../scripts/commitcheck.cjs');
+      const cm = cc.commitments(rows.map((r) => ({ ...r, total: BigInt(r.total) })));
+      meta = { totalsMustEqual: cm.total.toString(), tgeUnlockMustEqual: cm.unlock.toString(),
+        // A-6: 행 단위 공표 수치. 기본값은 표 자신과 일치한다.
+        rowsMustEqual: rows.map((r) => ({ label: r.label, total: String(r.total),
+          tgeUnlock: cc.tgeUnlockOf(BigInt(r.total), r.tgeBps, r.cliffMonths, r.linearMonths).toString(),
+          cliffMonths: r.cliffMonths, linearMonths: r.linearMonths })) };
     } catch (_) { meta = {}; }
     fs.writeFileSync(SCHED, JSON.stringify({ meta: { ...meta, ...metaOver }, rows }, null, 2));
   }
@@ -2137,6 +2142,68 @@ const env = (s) => ({
     ok(tb === await blockNo(t.f.provider), '그리고 아무것도 배포되지 않았다 (12차)');
     const tOk = await run('deploy.cjs', denv(t, { FIRST_DEPLOY: '1' }));
     ok(tOk.status === 0 && !!readRec(97).addresses.HCOWToken, '대조군: FIRST_DEPLOY=1 이면 테스트넷에서 배포한다 (12차)');
+  }
+
+  console.log('\nA-6 — 행 단위 공표 수치 (13차 L5)\n');
+  {
+    // 두 행을 서로 상쇄되게 바꾸면 합계 두 개(총량 · TGE 언락)는 그대로다. 그래서
+    // 12차 검사를 통과한다. 행 단위 대조가 잡아야 한다. 상쇄가 wei 단위로 정확하도록
+    // 두 행의 수량을 10,000 wei 의 배수로 둔다 (그렇지 않으면 내림 1 wei 차이로
+    // 12차 검사가 대신 걸려서, 이 테스트가 엉뚱한 이유로 통과한다).
+    const TOTAL = ethers.parseUnits('200000000', 18);
+    const T = ethers.parseUnits('20000000', 18);
+    const per = TOTAL / 9n;
+    const X = per + 2n * (per - T);
+    clearRec();
+    const s = await stageWall();
+    const claim = await mainReady(s);
+    const base = (o = {}) => ({
+      0: { total: T.toString(), ...(o[0] || {}) },
+      1: { total: X.toString() },
+      3: { beneficiary: claim, total: T.toString(), ...(o[3] || {}) },
+    });
+    writeSchedule(TOTAL, 9, base());
+    const published = JSON.parse(fs.readFileSync(SCHED, 'utf8')).meta;
+    ok(Array.isArray(published.rowsMustEqual) && published.rowsMustEqual.length === 9, 'fixture: 공표 행 9개');
+
+    // 1) Airdrop TGE 1350→0, Public TGE 1350→2700. 합계 두 개는 그대로.
+    writeSchedule(TOTAL, 9, base({ 0: { tgeBps: 2700 }, 3: { tgeBps: 0 } }), published);
+    const offset = await run('deploy.cjs', menv(s));
+    says(offset, 'does not match its own published rows', '두 행을 상쇄되게 바꾸면 메인넷 배포가 거부된다 (A-6)');
+    ok(!offset.out.includes('does not match its own published figures'), '그리고 합계 검사는 통과했다 — 행 단위 검사가 잡은 것이다 (A-6 대조)');
+    ok(offset.out.includes('row 0 (Public): tgeUnlock') && offset.out.includes('row 3 (Airdrop): tgeUnlock'), '어느 행이 어떻게 다른지 말한다 (A-6)');
+    ok(!readRec(56).addresses.HCOWVesting, '그리고 베스팅이 배포되지 않았다 (A-6)');
+
+    // 2) 클리프만 바꾸면 TGE 언락도 합계도 그대로다.
+    writeSchedule(TOTAL, 9, base({ 0: { cliffMonths: 6 } }), published);
+    const cliff = await run('deploy.cjs', menv(s));
+    says(cliff, 'row 0 (Public): cliffMonths is 6 but the published figure is 0', '클리프만 바뀌어도 거부된다 (A-6)');
+
+    // 3) 공표 행이 없거나, 개수가 다르거나, 순서가 다르면 거부된다.
+    writeSchedule(TOTAL, 9, base(), { ...published, rowsMustEqual: undefined });
+    says(await run('deploy.cjs', menv(s)), 'meta.rowsMustEqual has undefined', '메인넷에서 공표 행이 없으면 거부된다 (A-6)');
+    writeSchedule(TOTAL, 9, base(), { ...published, rowsMustEqual: published.rowsMustEqual.slice(0, 8) });
+    says(await run('deploy.cjs', menv(s)), 'meta.rowsMustEqual has 8 entries', '공표 행이 8개면 거부된다 (A-6)');
+    const swapped = published.rowsMustEqual.slice();
+    [swapped[0], swapped[1]] = [swapped[1], swapped[0]];
+    writeSchedule(TOTAL, 9, base(), { ...published, rowsMustEqual: swapped });
+    says(await run('deploy.cjs', menv(s)), 'row 0 (Public): the published row 0 is "Private"', '공표 행 순서가 다르면 거부된다 (A-6)');
+    const typo = published.rowsMustEqual.map((r, i) => (i === 3 ? { ...r, total: '8e24' } : r));
+    writeSchedule(TOTAL, 9, base(), { ...published, rowsMustEqual: typo });
+    says(await run('deploy.cjs', menv(s)), 'meta.rowsMustEqual[3].total is "8e24"', '숫자가 아닌 공표값은 거부된다 (A-6)');
+    ok(!readRec(56).addresses.HCOWVesting, '그리고 여기까지 베스팅이 배포되지 않았다 (A-6)');
+
+    // 대조군: 표가 공표 수치와 같으면 배포된다.
+    writeSchedule(TOTAL, 9, base(), published);
+    const good = await run('deploy.cjs', menv(s));
+    ok(good.status === 0 && !!readRec(56).addresses.HCOWVesting, '대조군: 행이 공표 수치와 같으면 메인넷 배포가 진행된다 (A-6)');
+
+    // 테스트넷은 행 단위 공표 수치를 요구하지 않는다.
+    clearRec();
+    const t = await stageTestnet();
+    writeSchedule(ethers.parseUnits('200000000', 18), 9, {}, { rowsMustEqual: undefined });
+    const tn = await run('deploy.cjs', denv(t, { FIRST_DEPLOY: '1' }));
+    ok(tn.status === 0 && !!readRec(97).addresses.HCOWVesting, '대조군: 테스트넷은 공표 행 없이도 배포된다 (A-6)');
   }
 
   console.log('\n12차 — 스케줄 파일의 공표 수치와 claim 창 (M-2 · L-3)\n');

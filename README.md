@@ -423,6 +423,14 @@ contract: **the owner is a 2-of-3 multisig, and every root ever written emits a
 public `RoundSet` event before it can pay anyone.** `minRoundNotice` is what
 makes "before" true.
 
+**The contract does not tie `claimDeadline` to the rounds.** A deadline that
+falls before the last round could open `sweep` while tokens that no round has
+yet paid are still in the contract, without breaking any of the five rules
+below. The deployment scripts refuse that shape (`deploy-claim.cjs` requires
+`claimDeadline − minClaimWindow` to be no earlier than TGE, and `deploy.cjs`
+requires the Airdrop row to finish vesting by then), but that is a check in the
+scripts, not a guarantee of the contract.
+
 What the contract does enforce, and all of it:
 
 ```
@@ -529,8 +537,10 @@ This extends the list above; steps 1-3 there are unchanged.
 4  deploy.cjs            HCOWVesting, with HCOW_ADDRESS. Mainnet refuses without a recorded
                          HCOWClaim, if the claim is not the Airdrop row's beneficiary, if the
                          table's total or TGE unlock differs from the file's own published
-                         figures (meta.totalsMustEqual / meta.tgeUnlockMustEqual), or if the
-                         Airdrop row finishes vesting after claimDeadline − minClaimWindow
+                         figures (meta.totalsMustEqual / meta.tgeUnlockMustEqual), if any row's
+                         total, TGE unlock, cliff or linear months differs from the published
+                         row (meta.rowsMustEqual, in table order), or if the Airdrop row
+                         finishes vesting after claimDeadline − minClaimWindow
 5  load.cjs, seal.cjs    PRINT_ONLY for the Safe; confirm with DRY_RUN=yes seal.cjs
 6  set-root.cjs round 0  BEFORE TGE by at least max(1 day, minRoundNotice). Round 0 pays at
                          TGE, so it must be registered ahead of it. set-root counts what the
